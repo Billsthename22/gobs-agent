@@ -1,0 +1,9 @@
+/target
+.DS_Store
+
+# Local/generated macOS app bundle
+/GBOS Agent.app/
+
+# Local backup files
+*.backup
+*.before-thread-fix.rs
