@@ -1,3 +1,6 @@
 fn main() {
-    println!("cargo:rustc-link-lib=framework=CoreLocation");
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-lib=framework=CoreLocation");
+    }
 }
