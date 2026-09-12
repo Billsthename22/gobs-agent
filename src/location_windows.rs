@@ -22,28 +22,40 @@ impl LocationManager {
 
         std::thread::spawn(move || {
             let result = (|| -> windows::core::Result<()> {
-                let locator = Geolocator::new()?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        windows::core::Error::new(
+                            windows::core::HRESULT(0x80004005u32 as i32),
+                            format!("Failed to create Tokio runtime: {error}"),
+                        )
+                    })?;
 
-                println!("Windows Geolocator initialized");
+                runtime.block_on(async {
+                    let locator = Geolocator::new()?;
 
-                let operation = locator.GetGeopositionAsync()?;
-                let position: Geoposition = operation.get()?;
+                    println!("Windows Geolocator initialized");
 
-                let coordinate = position.Coordinate()?;
+                    let position: Geoposition =
+                        locator.GetGeopositionAsync()?.await?;
 
-                let latitude = coordinate.Latitude()?;
-                let longitude = coordinate.Longitude()?;
+                    let coordinate = position.Coordinate()?;
 
-                println!(
-                    "Windows location fix: {:.6}, {:.6}",
-                    latitude, longitude
-                );
+                    let latitude = coordinate.Latitude()?;
+                    let longitude = coordinate.Longitude()?;
 
-                if let Ok(mut location) = latest_location.lock() {
-                    *location = Some((latitude, longitude));
-                }
+                    println!(
+                        "Windows location fix: {:.6}, {:.6}",
+                        latitude, longitude
+                    );
 
-                Ok(())
+                    if let Ok(mut location) = latest_location.lock() {
+                        *location = Some((latitude, longitude));
+                    }
+
+                    Ok::<(), windows::core::Error>(())
+                })
             })();
 
             if let Err(error) = result {
