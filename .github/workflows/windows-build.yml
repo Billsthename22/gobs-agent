@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "agent/**"
+      - "**"
       - ".github/workflows/windows-build.yml"
 
 jobs:
@@ -22,11 +22,10 @@ jobs:
           target: x86_64-pc-windows-msvc
 
       - name: Build agent
-        working-directory: agent
         run: cargo build --release --bin agent --target x86_64-pc-windows-msvc
 
       - name: Upload Windows agent
         uses: actions/upload-artifact@v4
         with:
           name: gbos-agent-windows-x64
-          path: agent/target/x86_64-pc-windows-msvc/release/agent.exe
+          path: target/x86_64-pc-windows-msvc/release/agent.exe
