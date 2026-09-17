@@ -12,12 +12,90 @@ mod video;
 use std::env;
 use std::time::Duration;
 
+fn gbos_api_url() -> String {
+    env::var("GBOS_API_URL")
+        .unwrap_or_else(|_| "https://gbos-backend-production.up.railway.app".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn gbos_ws_url() -> String {
+    let api_url = gbos_api_url();
+
+    if let Some(rest) = api_url.strip_prefix("https://") {
+        format!("wss://{}", rest)
+    } else if let Some(rest) = api_url.strip_prefix("http://") {
+        format!("ws://{}", rest)
+    } else {
+        format!("ws://{}", api_url)
+    }
+}
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sysinfo::{Disks, Networks, System};
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::interval;
+
+#[derive(serde::Deserialize)]
+struct AgentRegisterResponse {
+    device_id: i32,
+    device_name: String,
+    hostname: String,
+    status: String,
+    websocket_url: String,
+}
+
+async fn register_agent() -> Result<i32, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+
+    let hostname = sysinfo::System::host_name()
+        .unwrap_or_else(|| "GBOS-UNKNOWN".to_string());
+
+    let operating_system = sysinfo::System::long_os_version()
+        .unwrap_or_else(|| std::env::consts::OS.to_string());
+
+    let payload = serde_json::json!({
+        "device_name": hostname,
+        "hostname": hostname,
+        "operating_system": operating_system,
+        "ip_address": null
+    });
+
+    println!("Registering agent with GBOS backend...");
+    println!("Hostname: {}", hostname);
+    println!("OS: {}", operating_system);
+
+    let response = client
+        .post(format!("{}/agents/register", gbos_api_url()))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        return Err(format!(
+            "Agent registration failed: {} - {}",
+            status, body
+        )
+        .into());
+    }
+
+    let registration: AgentRegisterResponse = response.json().await?;
+
+    println!("Agent registered successfully!");
+    println!("Device ID: {}", registration.device_id);
+    println!("Device name: {}", registration.device_name);
+    println!("Hostname: {}", registration.hostname);
+    println!("Status: {}", registration.status);
+    println!("WebSocket: {}", registration.websocket_url);
+
+    Ok(registration.device_id)
+}
+
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 fn current_username() -> String {
@@ -79,7 +157,14 @@ fn detect_console_user() -> Option<String> {
 }
 #[tokio::main]
 async fn main() {
-    let device_id = 1;
+    let device_id = match register_agent().await {
+        Ok(id) => id,
+        Err(error) => {
+            println!("Agent registration failed!");
+            println!("Error: {}", error);
+            return;
+        }
+    };
 
     let initial_console_user = detect_console_user();
 
@@ -88,7 +173,7 @@ async fn main() {
 
     let mut last_console_user = initial_console_user;
 
-    let url = format!("ws://127.0.0.1:8000/ws/devices/{}", device_id);
+    let url = format!("{}/ws/devices/{}", gbos_ws_url(), device_id);
 
     println!("GBOS Device Agent");
     println!("Connecting to {}", url);
