@@ -19,7 +19,19 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 windows = { version = "0.62.2", features = [
     "Devices_Geolocation",
     "Foundation",
-]}
+    # Service lifecycle and per-session helper. Module placement is not
+    # guessable — `CreateProcessAsUserW` lives under Threading, while the WTS
+    # session APIs live under RemoteDesktop.
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }
+windows-service = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

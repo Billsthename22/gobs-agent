@@ -4,8 +4,8 @@
 //!
 //! Requires Screen Recording permission on macOS.
 
-use openh264::formats::RgbaSliceU8;
 use openh264::encoder::FrameType;
+use openh264::formats::RgbaSliceU8;
 
 use agent::video::{annexb_nals, capture_frame_rgba, create_encoder, nal_type};
 
@@ -35,9 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        active
-            .yuv
-            .read_rgba8(RgbaSliceU8::new(&rgba, (w2, h2)));
+        active.yuv.read_rgba8(RgbaSliceU8::new(&rgba, (w2, h2)));
 
         let ts = openh264::Timestamp::from_millis((frame * 1000 / FPS) as u64);
         let bitstream = active.encoder.encode_at(&active.yuv, ts)?;
@@ -73,7 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if !ok {
             // Dump the raw frame for a mismatch so it can be inspected.
-            println!("  raw len={} first 40: {:02x?}", raw.len(), &raw[..raw.len().min(40)]);
+            println!(
+                "  raw len={} first 40: {:02x?}",
+                raw.len(),
+                &raw[..raw.len().min(40)]
+            );
         }
     }
 

@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# Package postinstall. Runs as root, with the binary already in place.
+#
+# All of the work is delegated to the binary's own --install-service, so a
+# packaged install and a hand-run `sudo gbos-agent --install-service` do exactly
+# the same things in the same order. Writing the launchd plist here instead
+# would mean maintaining two descriptions of the same daemon.
+#
+# This always exits 0 on purpose. The Installer treats a non-zero exit as a
+# failed installation and says so in bold to the user — but by the time this
+# runs the files are already installed, and a daemon that could not be started
+# is fixable afterwards with one command. Reporting the problem and leaving the
+# installation in place is the more honest outcome.
+
+set -u
+
+# Installer runs scripts with a minimal environment; both launchctl (/bin) and
+# chown (/usr/sbin) have to be findable by the binary this calls.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+BINARY=/usr/local/libexec/gbos-agent
+
+if [ ! -x "${BINARY}" ]; then
+    echo "gbos-agent: ${BINARY} is missing — the package did not install correctly." >&2
+    exit 0
+fi
+
+if "${BINARY}" --install-service; then
+    exit 0
+fi
+
+echo "gbos-agent: the background service could not be started automatically." >&2
+echo "gbos-agent: run 'sudo ${BINARY} --install-service' to retry." >&2
+echo "gbos-agent: run 'sudo ${BINARY} --status' to see what is wrong." >&2
+
+exit 0

@@ -3,8 +3,8 @@
 //! the NAL-unit scan used in video.rs for keyframe detection.
 
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
-    Profile, RateControlMode, UsageType, VuiConfig,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
+    RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVBuffer;
 
@@ -142,7 +142,12 @@ fn run(moving: bool, w: usize, h: usize) -> Result<(), Box<dyn std::error::Error
                 }
             }
             println!();
-            println!("sps={} pps={} idr_nals={:?}", types.contains(&NAL_SPS), types.contains(&NAL_PPS), idr_idx);
+            println!(
+                "sps={} pps={} idr_nals={:?}",
+                types.contains(&NAL_SPS),
+                types.contains(&NAL_PPS),
+                idr_idx
+            );
         }
     }
 

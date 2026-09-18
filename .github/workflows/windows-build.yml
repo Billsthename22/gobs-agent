@@ -24,6 +24,49 @@ jobs:
       - name: Build agent
         run: cargo build --release --bin agent --target x86_64-pc-windows-msvc
 
+      # The installer is built here rather than on a Mac because NSIS on Windows
+      # is the supported path, and because the .exe it packages can only be
+      # produced here: cross-compiling MSVC from macOS is not possible.
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if (-not $version) { throw "Could not read the version from Cargo.toml" }
+
+          # NSIS ships on the windows-latest image; the fallback is here so a
+          # future image without it fails on a clear error rather than on
+          # "makensis is not recognized".
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) {
+            $fromPath = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($fromPath) {
+              $makensis = $fromPath.Source
+            } else {
+              choco install nsis -y --no-progress
+              if (-not (Test-Path $makensis)) { throw "NSIS is not installed and could not be installed" }
+            }
+          }
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+          & $makensis `
+            "/DPRODUCT_VERSION=$version" `
+            "/DPRODUCT_VERSION_4=$version.0" `
+            "/DSOURCE_EXE=$($pwd.Path)\target\x86_64-pc-windows-msvc\release\agent.exe" `
+            "/DOUTFILE=$($pwd.Path)\dist\GBOS-Agent-Windows.exe" `
+            "packaging\windows\installer.nsi"
+
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: gbos-agent-windows-installer
+          path: dist/GBOS-Agent-Windows.exe
+
+      # The loose binary is kept for anyone who wants to run the agent without
+      # installing it — the agent falls back to the foreground when it is not
+      # started by the service manager.
       - name: Upload Windows agent
         uses: actions/upload-artifact@v4
         with:

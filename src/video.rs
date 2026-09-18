@@ -26,8 +26,8 @@
 //! `avc1` parameter sets live in the avcC config payload, not in video
 //! samples; SPS/PPS NALs are therefore removed during AVCC conversion.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -37,10 +37,30 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use openh264::OpenH264API;
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType,
-    IntraFramePeriod, Profile, RateControlMode, UsageType, VuiConfig,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile,
+    RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::{RgbaSliceU8, YUVBuffer};
+
+// ---------------------------------------------------------------------------
+// Platform capability
+// ---------------------------------------------------------------------------
+
+/// Whether screen streaming can work in this build.
+///
+/// macOS runs the agent as a root launchd daemon, which has no GUI session.
+/// Screen Recording is a per-user TCC permission that cannot be prompted for
+/// from a daemon, so capture would fail indefinitely. Windows runs the
+/// capture in a per-session helper instead (see `session.rs`), so it can.
+///
+/// Kept as a runtime constant rather than `cfg`-ing out the handler bodies, so
+/// one code path compiles everywhere and the agent can say *why* it refused.
+pub const SCREEN_STREAM_SUPPORTED: bool = !cfg!(target_os = "macos");
+
+/// Explanation logged when a backend stream request cannot be honoured.
+pub const SCREEN_STREAM_UNAVAILABLE_REASON: &str = "macOS runs the agent as a root \
+     LaunchDaemon with no GUI session, and Screen Recording is a per-user permission \
+     that cannot be granted to a daemon";
 
 // ---------------------------------------------------------------------------
 // Wire protocol
@@ -89,6 +109,25 @@ impl StreamPacket {
         bytes.extend_from_slice(&self.payload);
 
         bytes
+    }
+
+    /// Parse the on-wire binary form produced by [`StreamPacket::into_binary`].
+    ///
+    /// The Windows session helper captures and encodes in the user's session,
+    /// then hands the finished bytes to the service, which forwards them to the
+    /// backend unchanged. This is the inverse that makes that relay a no-op
+    /// rather than a re-encode.
+    pub fn from_binary(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 6 {
+            return None;
+        }
+
+        Some(Self {
+            kind: bytes[0],
+            keyframe: bytes[1] & STREAM_FLAG_KEYFRAME != 0,
+            timestamp_ms: u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+            payload: bytes[6..].to_vec(),
+        })
     }
 }
 
@@ -329,9 +368,7 @@ pub struct VideoStream {
 
 impl VideoStream {
     /// Start capturing + encoding the screen and pushing packets onto `sender`.
-    pub fn start(
-        sender: UnboundedSender<StreamPacket>,
-    ) -> std::io::Result<VideoStream> {
+    pub fn start(sender: UnboundedSender<StreamPacket>) -> std::io::Result<VideoStream> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
 
@@ -392,8 +429,8 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
         let (w, h, rgba) = match capture_frame_rgba() {
             Ok(frame) => frame,
             Err(error) => {
-                println!("Screen capture failed ❌");
-                println!("Error: {}", error);
+                crate::log_line!("Screen capture failed ❌");
+                crate::log_line!("Error: {}", error);
 
                 // Screen Recording permission may be pending; retry slowly.
                 std::thread::sleep(Duration::from_millis(500));
@@ -409,17 +446,14 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
         {
             match create_encoder(w, h) {
                 Ok(encoder) => {
-                    println!(
-                        "Screen encoder ready 🖥️ {}x{} @ {}fps (H.264)",
-                        w, h, FPS
-                    );
+                    crate::log_line!("Screen encoder ready 🖥️ {}x{} @ {}fps (H.264)", w, h, FPS);
 
                     active = Some(encoder);
                     stored_config = None;
                 }
                 Err(error) => {
-                    println!("Screen encoder init failed ❌");
-                    println!("Error: {}", error);
+                    crate::log_line!("Screen encoder init failed ❌");
+                    crate::log_line!("Error: {}", error);
 
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
@@ -441,8 +475,8 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
         let bitstream = match encoder.encoder.encode_at(&encoder.yuv, ts) {
             Ok(bitstream) => bitstream,
             Err(error) => {
-                println!("Screen encode failed ❌");
-                println!("Error: {:?}", error);
+                crate::log_line!("Screen encode failed ❌");
+                crate::log_line!("Error: {:?}", error);
                 continue;
             }
         };
@@ -474,7 +508,7 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
         let keyframe = openh264_is_key && nals_contain_idr;
 
         if openh264_is_key != nals_contain_idr {
-            println!(
+            crate::log_line!(
                 "⚠️  frame-type disagreement: openh264={:?} nal-scan={} → \
                  classifying as {}",
                 frame_type,
@@ -491,32 +525,21 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
         // that joins or reconnects mid-stream receives the avcC description in
         // time to decode that keyframe — not just at stream start.
         if keyframe {
-            let has_parameters =
-                types.contains(&NAL_SPS) && types.contains(&NAL_PPS);
+            let has_parameters = types.contains(&NAL_SPS) && types.contains(&NAL_PPS);
 
-            let resolution_changed = stored_config
-                .as_ref()
-                .map(|stored| (stored.0, stored.1))
-                != Some((w, h));
+            let resolution_changed =
+                stored_config.as_ref().map(|stored| (stored.0, stored.1)) != Some((w, h));
 
-            let rebuild = has_parameters
-                && (stored_config.is_none() || resolution_changed);
+            let rebuild = has_parameters && (stored_config.is_none() || resolution_changed);
 
             let resend = !rebuild
                 && stored_config.is_some()
-                && frame_index.saturating_sub(last_config_frame)
-                    >= FPS as u64;
+                && frame_index.saturating_sub(last_config_frame) >= FPS as u64;
 
             if rebuild {
-                let sps = nals
-                    .iter()
-                    .find(|nal| nal_type(nal) == NAL_SPS)
-                    .copied();
+                let sps = nals.iter().find(|nal| nal_type(nal) == NAL_SPS).copied();
 
-                let pps = nals
-                    .iter()
-                    .find(|nal| nal_type(nal) == NAL_PPS)
-                    .copied();
+                let pps = nals.iter().find(|nal| nal_type(nal) == NAL_PPS).copied();
 
                 if let (Some(sps), Some(pps)) = (sps, pps) {
                     let mut config = describe_stream(sps, pps);
@@ -538,7 +561,7 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
 
                     stored_config = Some((w, h, payload));
 
-                    println!(
+                    crate::log_line!(
                         "Screen stream config sent 📋 ({}x{} {}, avcC {} bytes)",
                         w, h, config.codec, config.description_len
                     );
@@ -556,7 +579,7 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
                         break; // websocket loop is gone
                     }
 
-                    println!("Screen stream config re-sent 🔁 (periodic)");
+                    crate::log_line!("Screen stream config re-sent 🔁 (periodic)");
                 }
             }
 
@@ -602,7 +625,7 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
         if frame_index % (FPS as u64 * 2) == 0 {
             let kind = if keyframe { "KEY" } else { "P  " };
 
-            println!(
+            crate::log_line!(
                 "Screen frame sent 🖥️ [{}] {} ms ({:.1} KB)",
                 kind,
                 timestamp_ms,
@@ -618,7 +641,7 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
         }
     }
 
-    println!(
+    crate::log_line!(
         "Screen stream stopped ({} frames over {:.1}s)",
         frame_index,
         started.elapsed().as_secs_f32()
@@ -637,6 +660,9 @@ mod tests {
             0, 0, 0, 1, 0x65, 0xcc, // four-byte Annex-B marker + IDR
         ];
 
-        assert_eq!(annexb_nals(&stream), vec![&[0x67, 0xaa][..], &[0x68, 0xbb], &[0x65, 0xcc]]);
+        assert_eq!(
+            annexb_nals(&stream),
+            vec![&[0x67, 0xaa][..], &[0x68, 0xbb], &[0x65, 0xcc]]
+        );
     }
 }
