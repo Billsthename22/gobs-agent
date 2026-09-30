@@ -1,0 +1,998 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import {
+Monitor,
+Wifi,
+WifiOff,
+Cpu,
+MemoryStick,
+HardDrive,
+Activity,
+Loader2,
+Square,
+} from "lucide-react";
+
+type Device = {
+id: number;
+device_name: string;
+hostname: string;
+device_code?: string;
+status: string;
+cpu_usage?: number;
+memory_usage?: number;
+storage_usage?: number;
+network_speed_mbps?: number;
+last_seen?: string;
+};
+
+type MonitoringSession = {
+id: number;
+device_id: number;
+status: string;
+is_authorized: boolean;
+started_at?: string;
+ended_at?: string | null;
+};
+
+type MonitoringData = {
+cpu_usage: number;
+memory_usage: number;
+storage_usage: number;
+network_speed_mbps: number;
+};
+
+type RemoteMonitorProps = {
+device?: Device | null;
+deviceId?: number | string;
+};
+
+export default function RemoteMonitor({
+device,
+deviceId,
+}: RemoteMonitorProps) {
+const [resolvedDevice, setResolvedDevice] =
+useState<Device | null>(device ?? null);
+
+const [resolvingDevice, setResolvingDevice] = useState(!device);
+
+const [session, setSession] =
+useState<MonitoringSession | null>(null);
+
+const [screenUrl, setScreenUrl] =
+useState<string | null>(null);
+
+const screenUrlRef = useRef<string | null>(null);
+const websocketRef = useRef<WebSocket | null>(null);
+
+const [isStarting, setIsStarting] = useState(false);
+const [isStopping, setIsStopping] = useState(false);
+const [screenLoading, setScreenLoading] = useState(false);
+const [connected, setConnected] = useState(false);
+
+const [monitoringData, setMonitoringData] =
+useState<MonitoringData>({
+cpu_usage: 0,
+memory_usage: 0,
+storage_usage: 0,
+network_speed_mbps: 0,
+});
+
+/*
+
+* Resolve device.
+*
+* The monitor page can pass:
+* PC-001
+*
+* while the backend needs:
+* device_id = 1
+  */
+  useEffect(() => {
+  if (device) {
+  setResolvedDevice(device);
+  setResolvingDevice(false);
+  return;
+  }
+
+
+if (
+
+
+
+  deviceId === undefined ||
+  deviceId === null ||
+  deviceId === ""
+) {
+  setResolvingDevice(false);
+  return;
+}
+
+let cancelled = false;
+
+const resolveDevice = async () => {
+  setResolvingDevice(true);
+
+  try {
+    /*
+     * If the supplied ID is numeric, try the direct
+     * device endpoint first.
+     */
+    if (
+      typeof deviceId === "number" ||
+      /^\d+$/.test(String(deviceId))
+    ) {
+      const numericId = Number(deviceId);
+
+      const directResponse = await fetch(
+        `http://127.0.0.1:8000/devices/${numericId}`,
+      );
+
+      if (directResponse.ok) {
+        const data = await directResponse.json();
+
+        if (!cancelled) {
+          console.log(
+            "Resolved device:",
+            deviceId,
+            "→",
+            data.id,
+            data.device_name,
+            data.hostname,
+          );
+
+          setResolvedDevice(data);
+          setResolvingDevice(false);
+        }
+
+        return;
+      }
+    }
+
+    /*
+     * For values such as PC-001, resolve against the
+     * dashboard device health endpoint.
+     */
+    const healthResponse = await fetch(
+      "http://127.0.0.1:8000/dashboard/device-health",
+    );
+
+    if (!healthResponse.ok) {
+      throw new Error(
+        `Device health request failed: ${healthResponse.status}`,
+      );
+    }
+
+    const devices: Device[] =
+      await healthResponse.json();
+
+    const requestedId = String(deviceId)
+      .trim()
+      .toLowerCase();
+
+    const foundDevice = devices.find((item) => {
+      return (
+        String(item.id).toLowerCase() === requestedId ||
+        String(item.device_code ?? "")
+          .trim()
+          .toLowerCase() === requestedId ||
+        String(item.hostname ?? "")
+          .trim()
+          .toLowerCase() === requestedId ||
+        String(item.device_name ?? "")
+          .trim()
+          .toLowerCase() === requestedId
+      );
+    });
+
+    if (foundDevice) {
+      if (!cancelled) {
+        console.log(
+          "Resolved device:",
+          deviceId,
+          "→",
+          foundDevice.id,
+          foundDevice.device_name,
+          foundDevice.hostname,
+        );
+
+        setResolvedDevice(foundDevice);
+        setResolvingDevice(false);
+      }
+
+      return;
+    }
+
+    /*
+     * Fallback to the regular devices endpoint.
+     */
+    const devicesResponse = await fetch(
+      "http://127.0.0.1:8000/devices",
+    );
+
+    if (devicesResponse.ok) {
+      const allDevices: Device[] =
+        await devicesResponse.json();
+
+      const fallbackDevice = allDevices.find((item) => {
+        return (
+          String(item.id).toLowerCase() === requestedId ||
+          String(item.device_code ?? "")
+            .trim()
+            .toLowerCase() === requestedId ||
+          String(item.hostname ?? "")
+            .trim()
+            .toLowerCase() === requestedId ||
+          String(item.device_name ?? "")
+            .trim()
+            .toLowerCase() === requestedId
+        );
+      });
+
+      if (fallbackDevice && !cancelled) {
+        console.log(
+          "Resolved device:",
+          deviceId,
+          "→",
+          fallbackDevice.id,
+          fallbackDevice.device_name,
+          fallbackDevice.hostname,
+        );
+
+        setResolvedDevice(fallbackDevice);
+        setResolvingDevice(false);
+      }
+
+      return;
+    }
+
+    throw new Error(
+      `Could not resolve device "${deviceId}"`,
+    );
+  } catch (error) {
+    console.error(
+      "Failed to resolve device:",
+      error,
+    );
+
+    if (!cancelled) {
+      setResolvedDevice(null);
+      setResolvingDevice(false);
+    }
+  }
+};
+
+resolveDevice();
+
+return () => {
+  cancelled = true;
+};
+
+
+}, [device, deviceId]);
+
+/*
+
+* Connect to monitoring WebSocket.
+  */
+  useEffect(() => {
+  if (!session || session.status !== "active") {
+  return;
+  }
+
+
+console.log(
+
+
+  "Opening monitoring WebSocket for session:",
+  session.id,
+);
+
+const websocket = new WebSocket(
+  `ws://127.0.0.1:8000/ws/monitoring/${session.id}`,
+);
+
+websocket.binaryType = "arraybuffer";
+
+websocketRef.current = websocket;
+
+websocket.onopen = () => {
+  console.log(
+    "Monitoring WebSocket connected ✅",
+  );
+
+  setConnected(true);
+};
+
+websocket.onmessage = (event) => {
+  console.log(
+    "Monitoring WebSocket message:",
+    typeof event.data,
+    event.data instanceof ArrayBuffer
+      ? `ArrayBuffer ${event.data.byteLength} bytes`
+      : event.data instanceof Blob
+        ? `Blob ${event.data.size} bytes`
+        : event.data,
+  );
+
+  /*
+   * ARRAYBUFFER SCREEN FRAME
+   */
+  if (event.data instanceof ArrayBuffer) {
+    const blob = new Blob([event.data], {
+      type: "image/png",
+    });
+
+    console.log(
+      "Received screen frame:",
+      blob.size,
+      "bytes",
+    );
+
+    const objectUrl =
+      URL.createObjectURL(blob);
+
+    const previousUrl =
+      screenUrlRef.current;
+
+    screenUrlRef.current = objectUrl;
+
+    setScreenUrl(objectUrl);
+    setScreenLoading(false);
+
+    const testImage = new Image();
+
+    testImage.onload = () => {
+      console.log(
+        "✅ Screen image decoded:",
+        testImage.width,
+        "x",
+        testImage.height,
+      );
+
+      if (
+        previousUrl &&
+        previousUrl !== objectUrl
+      ) {
+        URL.revokeObjectURL(previousUrl);
+      }
+    };
+
+    testImage.onerror = () => {
+      console.error(
+        "❌ Screen image failed to decode",
+      );
+
+      URL.revokeObjectURL(objectUrl);
+
+      if (
+        screenUrlRef.current === objectUrl
+      ) {
+        screenUrlRef.current = null;
+        setScreenUrl(null);
+        setScreenLoading(true);
+      }
+    };
+
+    testImage.src = objectUrl;
+
+    return;
+  }
+
+  /*
+   * BLOB SCREEN FRAME
+   */
+  if (event.data instanceof Blob) {
+    const blob =
+      event.data.type === "image/png"
+        ? event.data
+        : new Blob([event.data], {
+            type: "image/png",
+          });
+
+    console.log(
+      "Received screen Blob:",
+      blob.size,
+      "bytes",
+    );
+
+    const objectUrl =
+      URL.createObjectURL(blob);
+
+    const previousUrl =
+      screenUrlRef.current;
+
+    screenUrlRef.current = objectUrl;
+
+    setScreenUrl(objectUrl);
+    setScreenLoading(false);
+
+    const testImage = new Image();
+
+    testImage.onload = () => {
+      console.log(
+        "✅ Screen image decoded:",
+        testImage.width,
+        "x",
+        testImage.height,
+      );
+
+      if (
+        previousUrl &&
+        previousUrl !== objectUrl
+      ) {
+        URL.revokeObjectURL(previousUrl);
+      }
+    };
+
+    testImage.onerror = () => {
+      console.error(
+        "❌ Screen image failed to decode",
+      );
+
+      URL.revokeObjectURL(objectUrl);
+
+      if (
+        screenUrlRef.current === objectUrl
+      ) {
+        screenUrlRef.current = null;
+        setScreenUrl(null);
+        setScreenLoading(true);
+      }
+    };
+
+    testImage.src = objectUrl;
+
+    return;
+  }
+
+  /*
+   * JSON MESSAGE
+   */
+  if (typeof event.data === "string") {
+    try {
+      const message = JSON.parse(event.data);
+
+      console.log(
+        "Monitoring JSON message:",
+        message,
+      );
+
+      if (
+        message.type ===
+        "monitoring_connection"
+      ) {
+        console.log(
+          "Monitoring connection established:",
+          message,
+        );
+
+        setConnected(true);
+
+        return;
+      }
+
+      if (
+        message.type ===
+        "monitoring_data"
+      ) {
+        const data =
+          message.data ?? {};
+
+        setMonitoringData({
+          cpu_usage: Number(
+            data.cpu_usage ?? 0,
+          ),
+          memory_usage: Number(
+            data.memory_usage ?? 0,
+          ),
+          storage_usage: Number(
+            data.storage_usage ?? 0,
+          ),
+          network_speed_mbps: Number(
+            data.network_speed_mbps ?? 0,
+          ),
+        });
+
+        return;
+      }
+    } catch (error) {
+      console.error(
+        "Failed to parse monitoring message:",
+        error,
+      );
+    }
+  }
+};
+
+websocket.onerror = (error) => {
+  console.error(
+    "Monitoring WebSocket error ❌",
+    error,
+  );
+
+  setConnected(false);
+};
+
+websocket.onclose = () => {
+  console.log(
+    "Monitoring WebSocket closed 🔌",
+  );
+
+  setConnected(false);
+};
+
+return () => {
+  websocket.close();
+
+  if (
+    websocketRef.current === websocket
+  ) {
+    websocketRef.current = null;
+  }
+};
+
+
+}, [session]);
+
+/*
+
+* Clean screen URL on unmount.
+  */
+  useEffect(() => {
+  return () => {
+  if (screenUrlRef.current) {
+  URL.revokeObjectURL(
+  screenUrlRef.current,
+  );
+
+  screenUrlRef.current = null;
+  }
+  };
+  }, []);
+
+/*
+
+* START MONITORING
+  */
+  const startMonitoring = async () => {
+  if (!resolvedDevice) {
+  console.error(
+  "Cannot start monitoring: no device",
+  );
+
+  return;
+  }
+
+
+console.log(
+
+
+
+  "Starting monitoring for device:",
+  resolvedDevice.id,
+  resolvedDevice.device_name,
+);
+
+setIsStarting(true);
+setScreenLoading(true);
+
+try {
+  const response = await fetch(
+    "http://127.0.0.1:8000/remote-monitoring/start",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type":
+          "application/json",
+      },
+      body: JSON.stringify({
+        device_id:
+          resolvedDevice.id,
+      }),
+    },
+  );
+
+  const data =
+    await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data?.detail ||
+        "Failed to start monitoring",
+    );
+  }
+
+  console.log(
+    "Monitoring session started:",
+    data,
+  );
+
+  setSession(data);
+} catch (error) {
+  console.error(
+    "Failed to start monitoring:",
+    error,
+  );
+
+  setScreenLoading(false);
+} finally {
+  setIsStarting(false);
+}
+
+
+};
+
+/*
+
+* STOP MONITORING
+  */
+  const stopMonitoring = async () => {
+  if (!session) {
+  return;
+  }
+
+
+setIsStopping(true);
+
+
+
+try {
+  const response = await fetch(
+    `http://127.0.0.1:8000/remote-monitoring/${session.id}/stop`,
+    {
+      method: "POST",
+    },
+  );
+
+  const data =
+    await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data?.detail ||
+        "Failed to stop monitoring",
+    );
+  }
+
+  console.log(
+    "Monitoring session stopped:",
+    data,
+  );
+
+  websocketRef.current?.close();
+
+  setSession(null);
+  setConnected(false);
+  setScreenLoading(false);
+
+  if (screenUrlRef.current) {
+    URL.revokeObjectURL(
+      screenUrlRef.current,
+    );
+
+    screenUrlRef.current = null;
+  }
+
+  setScreenUrl(null);
+} catch (error) {
+  console.error(
+    "Failed to stop monitoring:",
+    error,
+  );
+} finally {
+  setIsStopping(false);
+}
+
+
+};
+
+/*
+
+* DEVICE RESOLUTION LOADING
+  */
+  if (resolvingDevice) {
+  return (
+
+   <div className="flex min-h-[500px] items-center justify-center rounded-2xl border border-zinc-200 bg-white">
+     <div className="text-center">
+       <Loader2
+         size={30}
+         className="mx-auto mb-3 animate-spin text-zinc-400"
+       />
+
+
+   <p className="text-sm font-medium text-zinc-900">
+     Loading device...
+   </p>
+
+   <p className="mt-1 text-xs text-zinc-500">
+     Resolving the selected GBOS device.
+   </p>
+  ```
+
+     </div>
+   </div>
+
+
+);
+
+
+}
+
+/*
+
+* DEVICE NOT FOUND
+  */
+  if (!resolvedDevice) {
+  return (
+
+   <div className="flex min-h-[500px] items-center justify-center rounded-2xl border border-zinc-200 bg-white">
+     <div className="text-center">
+       <Monitor
+         size={32}
+         className="mx-auto mb-3 text-zinc-400"
+       />
+
+  ```
+   <p className="text-sm font-medium text-zinc-900">
+     Device not found
+   </p>
+
+   <p className="mt-1 text-xs text-zinc-500">
+     Unable to resolve the selected device.
+   </p>
+
+   {deviceId && (
+     <p className="mt-2 text-[11px] text-zinc-400">
+       Device reference:{" "}
+       {String(deviceId)}
+     </p>
+   )}
+
+
+     </div>
+   </div>
+
+
+);
+
+
+}
+
+return ( <div className="space-y-5">
+{/* HEADER */} <div className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-white p-5"> <div className="flex items-center gap-4"> <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-zinc-100"> <Monitor
+           size={20}
+           className="text-zinc-700"
+         /> </div>
+
+```
+      <div>
+        <h2 className="text-sm font-semibold text-zinc-950">
+          {resolvedDevice.device_name}
+        </h2>
+
+        <p className="mt-0.5 text-xs text-zinc-500">
+          {resolvedDevice.hostname}
+        </p>
+      </div>
+    </div>
+
+    <div className="flex items-center gap-3">
+      <div
+        className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ${
+          connected
+            ? "bg-emerald-50 text-emerald-700"
+            : "bg-zinc-100 text-zinc-500"
+        }`}
+      >
+        {connected ? (
+          <>
+            <Wifi size={13} />
+            Connected
+          </>
+        ) : (
+          <>
+            <WifiOff size={13} />
+            Disconnected
+          </>
+        )}
+      </div>
+
+      {!session ? (
+        <button
+          type="button"
+          onClick={startMonitoring}
+          disabled={isStarting}
+          className="flex items-center gap-2 rounded-xl bg-zinc-950 px-4 py-2.5 text-xs font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {isStarting ? (
+            <>
+              <Loader2
+                size={14}
+                className="animate-spin"
+              />
+              Starting...
+            </>
+          ) : (
+            <>
+              <Monitor size={14} />
+              Start Monitoring
+            </>
+          )}
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={stopMonitoring}
+          disabled={isStopping}
+          className="flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-xs font-medium text-red-700 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {isStopping ? (
+            <>
+              <Loader2
+                size={14}
+                className="animate-spin"
+              />
+              Stopping...
+            </>
+          ) : (
+            <>
+              <Square size={13} />
+              Stop Monitoring
+            </>
+          )}
+        </button>
+      )}
+    </div>
+  </div>
+
+  {/* AUTHORIZATION NOTICE */}
+  {session && (
+    <div className="flex items-center justify-between rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+      <div>
+        <p className="text-xs font-semibold text-amber-900">
+          Authorized remote monitoring session
+        </p>
+
+        <p className="mt-0.5 text-[11px] text-amber-700">
+          Screen sharing is active for this device.
+        </p>
+      </div>
+
+      <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[10px] font-semibold text-amber-800">
+        Session #{session.id}
+      </span>
+    </div>
+  )}
+
+  {/* LIVE SCREEN */}
+  <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-white">
+    <div className="flex items-center justify-between border-b border-zinc-200 px-5 py-4">
+      <div>
+        <h3 className="text-sm font-semibold text-zinc-950">
+          Live Screen
+        </h3>
+
+        <p className="mt-0.5 text-xs text-zinc-500">
+          Real-time screen from the authorized device
+        </p>
+      </div>
+
+      {session && (
+        <div className="flex items-center gap-2 text-xs text-zinc-500">
+          <span
+            className={`h-2 w-2 rounded-full ${
+              screenUrl
+                ? "animate-pulse bg-emerald-500"
+                : "bg-zinc-300"
+            }`}
+          />
+
+          {screenUrl
+            ? "Streaming"
+            : "Waiting for screen..."}
+        </div>
+      )}
+    </div>
+
+    <div className="flex min-h-[500px] items-center justify-center bg-black">
+      {screenUrl ? (
+        <img
+          src={screenUrl}
+          alt="Live screen of the authorized device"
+          className="block max-h-[700px] max-w-full object-contain"
+        />
+      ) : screenLoading ? (
+        <div className="flex flex-col items-center justify-center text-center">
+          <Loader2
+            size={32}
+            className="mb-4 animate-spin text-white"
+          />
+
+          <p className="text-sm font-medium text-white">
+            Waiting for screen stream
+          </p>
+
+          <p className="mt-1 max-w-sm text-xs text-zinc-400">
+            The device is connecting and preparing the
+            authorized screen stream.
+          </p>
+        </div>
+      ) : (
+        <div className="flex flex-col items-center justify-center text-center">
+          <Monitor
+            size={40}
+            className="mb-4 text-zinc-600"
+          />
+
+          <p className="text-sm font-medium text-zinc-300">
+            Screen monitoring is not active
+          </p>
+
+          <p className="mt-1 max-w-sm text-xs text-zinc-500">
+            Start an authorized monitoring session to view
+            the device screen.
+          </p>
+        </div>
+      )}
+    </div>
+  </div>
+
+  {/* TELEMETRY */}
+  <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+    <TelemetryCard
+      icon={Cpu}
+      label="CPU Usage"
+      value={`${monitoringData.cpu_usage.toFixed(1)}%`}
+    />
+
+    <TelemetryCard
+      icon={MemoryStick}
+      label="Memory Usage"
+      value={`${monitoringData.memory_usage.toFixed(1)}%`}
+    />
+
+    <TelemetryCard
+      icon={HardDrive}
+      label="Storage Usage"
+      value={`${monitoringData.storage_usage.toFixed(1)}%`}
+    />
+
+    <TelemetryCard
+      icon={Activity}
+      label="Network"
+      value={`${monitoringData.network_speed_mbps.toFixed(2)} Mbps`}
+    />
+  </div>
+</div>
+
+
+);
+}
+
+function TelemetryCard({
+icon: Icon,
+label,
+value,
+}: {
+icon: typeof Cpu;
+label: string;
+value: string;
+}) {
+return ( <div className="rounded-2xl border border-zinc-200 bg-white p-4"> <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-xl bg-zinc-100"> <Icon
+       size={17}
+       className="text-zinc-600"
+     /> </div>
+
+
+  <p className="text-xs text-zinc-500">
+    {label}
+  </p>
+
+  <p className="mt-1 text-lg font-semibold text-zinc-950">
+    {value}
+  </p>
+</div>
+);
+}
