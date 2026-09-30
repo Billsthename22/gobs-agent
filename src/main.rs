@@ -9,6 +9,12 @@ mod location_windows;
 #[cfg(target_os = "windows")]
 use location_windows as location;
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod location_noop;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+use location_noop as location;
+
 #[cfg(target_os = "windows")]
 mod session;
 
