@@ -44,25 +44,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR,
+};
 use windows::Win32::Security::{
-    DuplicateTokenEx, InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SecurityImpersonation, SetSecurityDescriptorDacl,
-    TOKEN_ALL_ACCESS, TokenPrimary,
+    DuplicateTokenEx, InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SecurityImpersonation, SetSecurityDescriptorDacl, TOKEN_ALL_ACCESS,
+    TokenPrimary,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
-    GetNamedPipeClientSessionId, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeClientSessionId,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessWithTokenW,
-    LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
-    WaitForSingleObject,
+    LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::logging;
 use crate::video;
@@ -99,6 +100,11 @@ const NO_ACTIVE_SESSION: u32 = 0xFFFF_FFFF;
 /// pipe handle supports concurrent reads and writes.
 struct Pipe {
     handle: HANDLE,
+    /// A byte-mode pipe does not preserve message boundaries. The service can
+    /// replay its startup state while the async loop delivers a new command,
+    /// so serialize writes to prevent those newline-delimited messages from
+    /// interleaving or being applied out of order.
+    write_lock: Mutex<()>,
 }
 
 // SAFETY: a pipe HANDLE is an opaque kernel handle. Reads and writes on a
@@ -120,6 +126,15 @@ impl Drop for Pipe {
 }
 
 impl Pipe {
+    fn windows_error(error: &windows::core::Error) -> String {
+        let hresult = error.code().0 as u32;
+        let win32 = WIN32_ERROR::from_error(error)
+            .map(|code| code.0.to_string())
+            .unwrap_or_else(|| "not a Win32 error".to_string());
+
+        format!("{} (HRESULT 0x{hresult:08X}, Win32 {win32})", error)
+    }
+
     /// Read exactly `buffer.len()` bytes, or fail at end of pipe.
     fn read_exact(&self, buffer: &mut [u8]) -> io::Result<()> {
         let mut filled = 0usize;
@@ -137,13 +152,12 @@ impl Pipe {
                     None,
                 )
             }
-            .map_err(|error| io::Error::other(format!("ReadFile failed: {}", error)))?;
+            .map_err(|error| {
+                io::Error::other(format!("ReadFile failed: {}", Self::windows_error(&error)))
+            })?;
 
             if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "pipe closed",
-                ));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipe closed"));
             }
 
             filled += read as usize;
@@ -179,6 +193,11 @@ impl Pipe {
 
     /// Write every byte or fail.
     fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("named-pipe write lock was poisoned"))?;
+
         let mut written = 0usize;
 
         while written < bytes.len() {
@@ -186,15 +205,10 @@ impl Pipe {
 
             // SAFETY: `bytes[written..]` is valid for the duration of the call
             // and `wrote` is a live out-parameter.
-            unsafe {
-                WriteFile(
-                    self.handle,
-                    Some(&bytes[written..]),
-                    Some(&mut wrote),
-                    None,
-                )
-            }
-            .map_err(|error| io::Error::other(format!("WriteFile failed: {}", error)))?;
+            unsafe { WriteFile(self.handle, Some(&bytes[written..]), Some(&mut wrote), None) }
+                .map_err(|error| {
+                    io::Error::other(format!("WriteFile failed: {}", Self::windows_error(&error)))
+                })?;
 
             if wrote == 0 {
                 return Err(io::Error::new(io::ErrorKind::WriteZero, "pipe closed"));
@@ -220,7 +234,10 @@ impl Pipe {
         if length > MAX_FRAME_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("frame length {} exceeds the {} byte limit", length, MAX_FRAME_BYTES),
+                format!(
+                    "frame length {} exceeds the {} byte limit",
+                    length, MAX_FRAME_BYTES
+                ),
             ));
         }
 
@@ -280,9 +297,18 @@ impl Pipe {
                 None,
             )
         }
-        .map_err(|error| io::Error::other(format!("could not open {}: {}", pipe_name, error)))?;
+        .map_err(|error| {
+            io::Error::other(format!(
+                "could not open {}: {}",
+                pipe_name,
+                Self::windows_error(&error)
+            ))
+        })?;
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            write_lock: Mutex::new(()),
+        })
     }
 
     /// Create the service's pipe server.
@@ -360,14 +386,35 @@ impl Pipe {
             )));
         }
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            write_lock: Mutex::new(()),
+        })
     }
 
     /// Wait for the helper to connect. Blocking — call on a dedicated thread.
     fn accept_connection(&self) -> io::Result<()> {
         // SAFETY: the handle is a live pipe handle with no pending operations.
-        unsafe { ConnectNamedPipe(self.handle, None) }
-            .map_err(|error| io::Error::other(format!("ConnectNamedPipe failed: {}", error)))
+        match unsafe { ConnectNamedPipe(self.handle, None) } {
+            Ok(()) => Ok(()),
+
+            // The helper can open the pipe in the interval between
+            // CreateNamedPipeW and this call. Windows documents this as a
+            // successful connection even though ConnectNamedPipe returns zero.
+            Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
+                crate::log_line!(
+                    "Session helper connected before ConnectNamedPipe began \
+                     (ERROR_PIPE_CONNECTED / Win32 {})",
+                    ERROR_PIPE_CONNECTED.0
+                );
+                Ok(())
+            }
+
+            Err(error) => Err(io::Error::other(format!(
+                "ConnectNamedPipe failed: {}",
+                Self::windows_error(&error)
+            ))),
+        }
     }
 }
 
@@ -415,6 +462,8 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
         }
     };
 
+    crate::log_line!("Session helper connected to the service pipe");
+
     // Control messages arrive on a reader thread, because reading a blocking
     // pipe must not stall the frame-forwarding loop below.
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<String>();
@@ -423,10 +472,17 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
         let pipe = Arc::clone(&pipe);
 
         std::thread::spawn(move || {
+            crate::log_line!("Session helper control reader started");
+
             loop {
                 match pipe.read_control_line() {
                     Ok(line) => {
+                        crate::log_line!("Session helper control command received: {}", line);
+
                         if control_tx.send(line).is_err() {
+                            crate::log_line!(
+                                "Session helper control receiver is gone; control reader exiting"
+                            );
                             break;
                         }
                     }
@@ -434,7 +490,10 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
                     // The service closing the pipe is the normal shutdown
                     // path: dropping the sender makes the select arm below see
                     // the channel close and exit.
-                    Err(_) => break,
+                    Err(error) => {
+                        crate::log_line!("Session helper control reader stopped: {}", error);
+                        break;
+                    }
                 }
             }
         });
@@ -528,6 +587,8 @@ fn handle_control(
     match message.get("type").and_then(|value| value.as_str()) {
         Some("START_SCREEN_STREAM") => {
             if screen_stream.is_none() {
+                crate::log_line!("Session helper starting screen stream");
+
                 match video::VideoStream::start(screen_tx.clone()) {
                     Ok(handle) => {
                         *screen_stream = Some(handle);
@@ -701,6 +762,11 @@ pub struct SessionBridge {
     /// What the backend wants, kept so a new helper can be told.
     wanted: Arc<Wanted>,
 
+    /// Serializes changing desired state with replaying it to a newly attached
+    /// helper. Without this, a live START command can race an older startup
+    /// STOP replay and leave the helper disabled.
+    control_gate: Arc<Mutex<()>>,
+
     /// The connected helper, if one is running.
     link: Option<Link>,
 
@@ -718,6 +784,7 @@ impl SessionBridge {
             delegating: RUNNING_AS_SERVICE.load(Ordering::Relaxed),
             session_id: None,
             wanted: Arc::new(Wanted::default()),
+            control_gate: Arc::new(Mutex::new(())),
             link: None,
             fix: Arc::new(Mutex::new(None)),
         }
@@ -798,6 +865,11 @@ impl SessionBridge {
 
     /// Tell the helper whether to stream the screen.
     pub fn set_screen(&mut self, enabled: bool) {
+        let _control_guard = match self.control_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
         self.wanted.screen.store(enabled, Ordering::Relaxed);
 
         let message = if enabled {
@@ -806,14 +878,19 @@ impl SessionBridge {
             r#"{"type":"STOP_SCREEN_STREAM"}"#
         };
 
-        self.send_control(message);
+        self.send_control_locked(message);
     }
 
     /// Tell the helper whether to collect location.
     pub fn set_gps(&mut self, enabled: bool) {
+        let _control_guard = match self.control_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
         self.wanted.gps.store(enabled, Ordering::Relaxed);
 
-        self.send_control(&format!(
+        self.send_control_locked(&format!(
             r#"{{"type":"GPS_COLLECTION","enabled":{}}}"#,
             enabled
         ));
@@ -851,7 +928,7 @@ impl SessionBridge {
     }
 
     /// Write one control message to the connected helper, if there is one.
-    fn send_control(&self, message: &str) {
+    fn send_control_locked(&self, message: &str) {
         let Some(link) = &self.link else {
             // No helper yet. `wanted` already records the intent, and the
             // reader thread replays it when one connects.
@@ -862,11 +939,14 @@ impl SessionBridge {
             return;
         }
 
-        // One `WriteFile` of a short message, and the pipe's buffer was created
-        // at 64 KiB, so the write lands whole and two control messages cannot
-        // interleave.
+        crate::log_line!("Sending control command to session helper: {}", message);
+
+        // Keep the actual pipe write instrumented so a stuck named pipe is
+        // immediately distinguishable from a helper-side problem.
         if let Err(error) = link.pipe.write_line(message) {
             crate::log_line!("Could not send a command to the session helper: {}", error);
+        } else {
+            crate::log_line!("Control command delivered to session helper: {}", message);
         }
     }
 
@@ -911,6 +991,7 @@ impl SessionBridge {
 
             let screen_tx = self.screen_tx.clone();
             let wanted = Arc::clone(&self.wanted);
+            let control_gate = Arc::clone(&self.control_gate);
             let fix = Arc::clone(&self.fix);
 
             std::thread::spawn(move || {
@@ -938,38 +1019,60 @@ impl SessionBridge {
                     return;
                 }
 
-                connected.store(true, Ordering::Relaxed);
-
                 crate::log_line!("Session helper connected (session {})", session_id);
 
                 // Commands issued before the helper attached were stored rather
-                // than sent, so replay what the backend currently wants.
+                // than sent, so replay what the backend currently wants. Hold
+                // the same gate that protects set_screen/set_gps so a fresh
+                // live command cannot be overtaken by an obsolete replay.
+                let _control_guard = match control_gate.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                let mut initial_controls_delivered = true;
+
                 for line in wanted.control_lines() {
+                    crate::log_line!("Briefing session helper with control command: {}", line);
+
                     if let Err(error) = pipe.write_line(&line) {
                         crate::log_line!("Could not brief the session helper: {}", error);
 
+                        initial_controls_delivered = false;
                         break;
                     }
+
+                    crate::log_line!("Control command delivered to session helper: {}", line);
                 }
+
+                if !initial_controls_delivered {
+                    alive.store(false, Ordering::Relaxed);
+                    return;
+                }
+
+                connected.store(true, Ordering::Relaxed);
+
+                drop(_control_guard);
 
                 loop {
                     match pipe.read_frame() {
                         // Video. The payload is already in the format the
                         // backend expects, so it is not decoded and re-encoded —
                         // it is forwarded as the packet it is.
-                        Ok((FRAME_VIDEO, payload)) => match video::StreamPacket::from_binary(&payload)
-                        {
-                            Some(packet) => {
-                                if screen_tx.send(packet).is_err() {
-                                    break;
+                        Ok((FRAME_VIDEO, payload)) => {
+                            match video::StreamPacket::from_binary(&payload) {
+                                Some(packet) => {
+                                    if screen_tx.send(packet).is_err() {
+                                        break;
+                                    }
                                 }
-                            }
 
-                            None => crate::log_line!(
-                                "Discarded a malformed screen frame from the session helper ({} bytes)",
-                                payload.len()
-                            ),
-                        },
+                                None => crate::log_line!(
+                                    "Discarded a malformed screen frame from the session helper ({} bytes)",
+                                    payload.len()
+                                ),
+                            }
+                        }
 
                         Ok((FRAME_GPS, payload)) => {
                             match serde_json::from_slice::<serde_json::Value>(&payload) {
@@ -1150,7 +1253,9 @@ fn launch_helper(session_id: u32, pipe_name: &str) -> Result<Owned, String> {
         return Err(format!("DuplicateTokenEx failed: {}", error));
     }
 
-    let primary_token = Owned { handle: primary_token };
+    let primary_token = Owned {
+        handle: primary_token,
+    };
 
     // So the helper inherits the user's environment rather than LocalSystem's.
     let mut environment = std::ptr::null_mut();
@@ -1285,7 +1390,10 @@ pub fn active_console_user() -> Option<String> {
     let username = unsafe {
         let slice = std::slice::from_raw_parts(buffer.0, length as usize / 2);
 
-        let end = slice.iter().position(|unit| *unit == 0).unwrap_or(slice.len());
+        let end = slice
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(slice.len());
 
         let username = String::from_utf16_lossy(&slice[..end]);
 

@@ -421,6 +421,7 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
     let mut last_config_frame: u64 = 0;
 
     let mut frame_index: u64 = 0;
+    let mut sent_video_frames: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
@@ -563,7 +564,10 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
 
                     crate::log_line!(
                         "Screen stream config sent 📋 ({}x{} {}, avcC {} bytes)",
-                        w, h, config.codec, config.description_len
+                        w,
+                        h,
+                        config.codec,
+                        config.description_len
                     );
                 }
             } else if resend {
@@ -622,11 +626,23 @@ fn run_stream(stop: Arc<AtomicBool>, sender: UnboundedSender<StreamPacket>) {
             break;
         }
 
-        if frame_index % (FPS as u64 * 2) == 0 {
+        sent_video_frames += 1;
+
+        if sent_video_frames == 1 {
+            crate::log_line!(
+                "First encoded screen frame sent 🖥️ [{}] {} ms ({:.1} KB)",
+                if keyframe { "KEY" } else { "P  " },
+                timestamp_ms,
+                annexb.len() as f64 / 1024.0
+            );
+        }
+
+        if sent_video_frames % (FPS as u64 * 2) == 0 {
             let kind = if keyframe { "KEY" } else { "P  " };
 
             crate::log_line!(
-                "Screen frame sent 🖥️ [{}] {} ms ({:.1} KB)",
+                "Screen frame #{} sent 🖥️ [{}] {} ms ({:.1} KB)",
+                sent_video_frames,
                 kind,
                 timestamp_ms,
                 annexb.len() as f64 / 1024.0

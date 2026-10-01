@@ -1,4 +1,5 @@
 mod service;
+mod power;
 
 #[cfg(target_os = "macos")]
 mod location;
@@ -174,8 +175,18 @@ fn detect_console_user() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// OS shutdown requests
+// OS shutdown signals and remote power commands
 // ---------------------------------------------------------------------------
+
+/// Execute one of the only two power operations the backend may request.
+///
+/// There is deliberately no shell here and no user-provided executable or
+/// argument: the WebSocket message is mapped to a fixed native invocation.
+/// `GBOS_POWER_COMMAND_DRY_RUN=1` is for test environments only and records
+/// the request without changing the host power state.
+fn execute_power_command(command: &str) -> Result<(), String> {
+    power::execute(command, env::var("GBOS_POWER_COMMAND_DRY_RUN").ok().as_deref() == Some("1"))
+}
 
 /// Shutdown signals from the operating system.
 ///
@@ -196,7 +207,7 @@ struct StopSignals {
 #[cfg(unix)]
 impl StopSignals {
     fn new() -> Self {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         Self {
             sigterm: signal(SignalKind::terminate()).ok(),
@@ -435,6 +446,10 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
     };
 
     let mut gps_enabled = false;
+    // A power request is terminal in normal operation. Keeping this local
+    // guard prevents a double click or duplicate WebSocket packet from
+    // launching a second native shutdown command before the host goes down.
+    static POWER_COMMAND_EXECUTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut gps_timer = interval(Duration::from_secs(10));
 
     // Created before the loop so no shutdown signal is dropped between
@@ -896,6 +911,124 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
                                         }
                                     }
 
+                                    Some("RESTART_DEVICE") | Some("SHUTDOWN_DEVICE") => {
+                                        let command = if message
+                                            .get("type")
+                                            .and_then(|value| value.as_str())
+                                            == Some("RESTART_DEVICE")
+                                        {
+                                            "restart"
+                                        } else {
+                                            "shutdown"
+                                        };
+                                        let Some(command_id) = message
+                                            .get("command_id")
+                                            .and_then(|value| value.as_str())
+                                        else {
+                                            crate::log_line!(
+                                                "[COMMAND] {} rejected: missing command_id",
+                                                command
+                                            );
+                                            continue;
+                                        };
+
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                        if !power::valid_request(command_id, message.get("expires_at").and_then(|v| v.as_u64()), now) {
+                                            let failed = json!({"type": "command_status", "command_id": command_id,
+                                                "command": command, "status": "failed", "detail": "Expired or malformed power request"});
+                                            let _ = websocket.send(Message::Text(failed.to_string().into())).await;
+                                            continue;
+                                        }
+
+                                        crate::log_line!(
+                                            "[COMMAND] command received type={} command_id={}",
+                                            command,
+                                            command_id
+                                        );
+
+                                        let acknowledged = json!({
+                                            "type": "command_status",
+                                            "command_id": command_id,
+                                            "command": command,
+                                            "status": "acknowledged"
+                                        });
+                                        if let Err(error) = websocket
+                                            .send(Message::Text(acknowledged.to_string().into()))
+                                            .await
+                                        {
+                                            crate::log_line!("[COMMAND] acknowledgement failed: {}", error);
+                                            break;
+                                        }
+
+                                        if POWER_COMMAND_EXECUTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                            let failed = json!({
+                                                "type": "command_status",
+                                                "command_id": command_id,
+                                                "command": command,
+                                                "status": "failed",
+                                                "detail": "another power command is already executing"
+                                            });
+                                            let _ = websocket.send(Message::Text(failed.to_string().into())).await;
+                                            crate::log_line!("[COMMAND] {} rejected: already executing", command);
+                                            continue;
+                                        }
+
+                                        crate::log_line!("[COMMAND] command execution started type={}", command);
+                                        let executing = json!({
+                                            "type": "command_status",
+                                            "command_id": command_id,
+                                            "command": command,
+                                            "status": "executing"
+                                        });
+                                        if let Err(error) = websocket
+                                            .send(Message::Text(executing.to_string().into()))
+                                            .await
+                                        {
+                                            POWER_COMMAND_EXECUTING.store(false, std::sync::atomic::Ordering::SeqCst);
+                                            crate::log_line!("[COMMAND] executing status failed: {}", error);
+                                            break;
+                                        }
+
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            execute_power_command(command)
+                                        }).await;
+                                        match result {
+                                            Ok(Ok(())) => {
+                                                let dry_run = env::var("GBOS_POWER_COMMAND_DRY_RUN").ok().as_deref() == Some("1");
+                                                if dry_run { POWER_COMMAND_EXECUTING.store(false, std::sync::atomic::Ordering::SeqCst); }
+                                                crate::log_line!("[COMMAND] {} execution result dry_run={}", command, dry_run);
+                                                let completed = json!({
+                                                    "type": "command_status",
+                                                    "command_id": command_id,
+                                                    "command": command,
+                                                    "status": "completed",
+                                                    "detail": if dry_run { "dry-run only; no OS power action" } else { "native power request accepted; physical outcome unverified" }
+                                                });
+                                                let _ = websocket.send(Message::Text(completed.to_string().into())).await;
+                                            }
+                                            Ok(Err(error)) => {
+                                                POWER_COMMAND_EXECUTING.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                crate::log_line!("[COMMAND] {} failed: {}", command, error);
+                                                let failed = json!({
+                                                    "type": "command_status",
+                                                    "command_id": command_id,
+                                                    "command": command,
+                                                    "status": "failed",
+                                                    "detail": error
+                                                });
+                                                let _ = websocket.send(Message::Text(failed.to_string().into())).await;
+                                            }
+                                            Err(error) => {
+                                                POWER_COMMAND_EXECUTING.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                crate::log_line!("[COMMAND] {} task failed: {}", command, error);
+                                                let failed = json!({"type": "command_status", "command_id": command_id,
+                                                    "command": command, "status": "failed", "detail": "Power executor task failed"});
+                                                let _ = websocket.send(Message::Text(failed.to_string().into())).await;
+                                            }
+                                        }
+                                    }
+
                                     _ => {}
                                 }
                             }
@@ -984,8 +1117,10 @@ fn handle_service_command(command: service::Command) -> ExitCode {
 /// Run the agent itself — under the service manager where there is one.
 #[cfg(target_os = "windows")]
 fn run_agent_entry() -> ExitCode {
-    match windows_service::service_dispatcher::start(service::windows::SERVICE_NAME, ffi_service_main)
-    {
+    match windows_service::service_dispatcher::start(
+        service::windows::SERVICE_NAME,
+        ffi_service_main,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
 
         Err(error) if is_not_started_by_service_manager(&error) => {

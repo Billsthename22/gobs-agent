@@ -38,13 +38,15 @@ pub enum Command {
 /// Hand-rolled rather than pulling in `clap`: four flags do not justify a
 /// dependency, and the agent's argument surface is deliberately tiny.
 pub fn command_from_args() -> Option<Command> {
-    std::env::args().skip(1).find_map(|argument| match argument.as_str() {
-        "--install-service" => Some(Command::InstallService),
-        "--uninstall-service" => Some(Command::UninstallService),
-        "--status" => Some(Command::ServiceStatus),
-        "--session-helper" => Some(Command::SessionHelper),
-        _ => None,
-    })
+    std::env::args()
+        .skip(1)
+        .find_map(|argument| match argument.as_str() {
+            "--install-service" => Some(Command::InstallService),
+            "--uninstall-service" => Some(Command::UninstallService),
+            "--status" => Some(Command::ServiceStatus),
+            "--session-helper" => Some(Command::SessionHelper),
+            _ => None,
+        })
 }
 
 /// Handle a service command, printing human-readable output.

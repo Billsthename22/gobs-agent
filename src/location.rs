@@ -50,7 +50,8 @@ define_class!(
 
                 crate::log_line!(
                     "Core Location fix: {:.6}, {:.6}",
-                    coordinate.latitude, coordinate.longitude
+                    coordinate.latitude,
+                    coordinate.longitude
                 );
 
                 if let Ok(mut latest) = self.ivars().latest_location.lock() {
@@ -71,7 +72,9 @@ define_class!(
 
             crate::log_line!(
                 "Core Location ERROR ❌ domain={} code={} description={}",
-                domain, code, description
+                domain,
+                code,
+                description
             );
         }
 
@@ -143,7 +146,9 @@ impl LocationManager {
                 while let Ok(command) = command_rx.try_recv() {
                     match command {
                         LocationCommand::Start => {
-                            crate::log_line!("Core Location: starting authorization/location updates");
+                            crate::log_line!(
+                                "Core Location: starting authorization/location updates"
+                            );
 
                             unsafe {
                                 manager.requestWhenInUseAuthorization();

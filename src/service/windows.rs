@@ -73,9 +73,9 @@ pub fn install() -> Result<(), String> {
                 .open_service(SERVICE_NAME, INSTALL_ACCESS)
                 .map_err(|error| format!("could not open the existing service: {}", error))?;
 
-            service
-                .change_config(&info)
-                .map_err(|error| format!("could not update the service configuration: {}", error))?;
+            service.change_config(&info).map_err(|error| {
+                format!("could not update the service configuration: {}", error)
+            })?;
 
             service
         }
@@ -151,16 +151,23 @@ pub fn status() -> ExitCode {
     println!("GBOS agent service status");
     println!("  service:    {}", SERVICE_NAME);
 
-    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
         Ok(manager) => manager,
         Err(error) => {
-            println!("  installed:  unknown (could not open the service manager: {})", error);
+            println!(
+                "  installed:  unknown (could not open the service manager: {})",
+                error
+            );
 
             return ExitCode::FAILURE;
         }
     };
 
-    let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
+    let service = match manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) {
         Ok(service) => service,
 
         Err(_) => {
@@ -283,9 +290,7 @@ fn wait_for_stopped(
 /// True when a `windows-service` error wraps the given Win32 error code.
 fn is_win32_error(error: &windows_service::Error, code: i32) -> bool {
     match error {
-        windows_service::Error::Winapi(io_error) => {
-            io_error.raw_os_error() == Some(code)
-        }
+        windows_service::Error::Winapi(io_error) => io_error.raw_os_error() == Some(code),
 
         _ => false,
     }

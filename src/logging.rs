@@ -205,8 +205,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 
     let year = year_of_era as i64 + era * 400;
 
-    let day_of_year =
-        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
 
     let month_prime = (5 * day_of_year + 2) / 153;
 

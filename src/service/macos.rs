@@ -199,10 +199,7 @@ fn write_plist(path: &Path) -> Result<(), String> {
 
     // launchd requires the plist to be owned by root; a leftover file from an
     // unprivileged install would otherwise be silently ignored.
-    let _ = Command::new("chown")
-        .arg("root:wheel")
-        .arg(path)
-        .status();
+    let _ = Command::new("chown").arg("root:wheel").arg(path).status();
 
     Ok(())
 }
@@ -269,8 +266,14 @@ fn plist_contents() -> String {
 fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|error| format!("could not set mode {:o} on {}: {}", mode, path.display(), error))
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
+        format!(
+            "could not set mode {:o} on {}: {}",
+            mode,
+            path.display(),
+            error
+        )
+    })
 }
 
 /// Run `launchctl` with `args`, mapping a non-zero exit into an error that
