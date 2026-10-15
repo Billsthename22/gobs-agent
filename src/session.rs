@@ -34,6 +34,7 @@
 //!     frontend's existing decoder is unchanged;
 //!   * kind 2 — GPS, payload is UTF-8 JSON `{"latitude":..,"longitude":..}`;
 //!   * kind 3 — log text, so helper output lands in the same log file.
+//!   * kind 4 — bounded application/presence transition JSON.
 //! * service → helper: newline-delimited JSON control messages, forwarded
 //!   verbatim from the backend (`START_SCREEN_STREAM`, `STOP_SCREEN_STREAM`,
 //!   `GPS_COLLECTION`).
@@ -84,6 +85,7 @@ const FRAME_GPS: u8 = 2;
 
 /// Log line as UTF-8 text.
 const FRAME_LOG: u8 = 3;
+const FRAME_ACTIVITY: u8 = 4;
 
 /// `WTSGetActiveConsoleSessionId` returns this when no session is attached
 /// (for example, at boot before anyone logs in, or on a locked headless host).
@@ -463,6 +465,12 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
     };
 
     crate::log_line!("Session helper connected to the service pipe");
+    let notice = match crate::windows_notice::Notice::start() {
+        Ok(notice) => notice,
+        Err(error) => { crate::log_line!("{}", error); return std::process::ExitCode::FAILURE; }
+    };
+    let mut presence = crate::presence::Tracker::default();
+    let mut presence_timer = tokio::time::interval(Duration::from_secs(5));
 
     // Control messages arrive on a reader thread, because reading a blocking
     // pipe must not stall the frame-forwarding loop below.
@@ -505,7 +513,7 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
     let mut gps_manager: Option<crate::location_windows::LocationManager> = None;
     let mut gps_timer = tokio::time::interval(Duration::from_secs(10));
 
-    loop {
+    'helper: loop {
         tokio::select! {
             // CONTROL FROM THE SERVICE
             message = control_rx.recv() => {
@@ -520,11 +528,24 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
                     &screen_tx,
                     &mut screen_stream,
                     &mut gps_manager,
+                    &notice,
                 );
+            }
+
+            _ = presence_timer.tick() => {
+                if !notice.healthy() { break; }
+                if let Some((app, idle)) = crate::windows_notice::sample() {
+                    for event in presence.sample(app, idle) {
+                        if pipe.write_frame(FRAME_ACTIVITY, event.to_string().as_bytes()).is_err() {
+                            break 'helper;
+                        }
+                    }
+                }
             }
 
             // SCREEN FRAMES → SERVICE
             Some(packet) = screen_rx.recv() => {
+                if !notice.healthy() { break; }
                 let kind = packet.kind;
                 let binary = packet.into_binary();
 
@@ -579,6 +600,7 @@ fn handle_control(
     screen_tx: &mpsc::UnboundedSender<video::StreamPacket>,
     screen_stream: &mut Option<video::VideoStream>,
     gps_manager: &mut Option<crate::location_windows::LocationManager>,
+    notice: &crate::windows_notice::Notice,
 ) {
     let Ok(message) = serde_json::from_str::<serde_json::Value>(message) else {
         return;
@@ -587,6 +609,10 @@ fn handle_control(
     match message.get("type").and_then(|value| value.as_str()) {
         Some("START_SCREEN_STREAM") => {
             if screen_stream.is_none() {
+                if !notice.healthy() || !notice.screen(true) {
+                    crate::log_line!("Screen monitoring refused: employee indicator unavailable");
+                    return;
+                }
                 crate::log_line!("Session helper starting screen stream");
 
                 match video::VideoStream::start(screen_tx.clone()) {
@@ -596,6 +622,7 @@ fn handle_control(
                     }
 
                     Err(error) => {
+                        let _ = notice.screen(false);
                         let _ = pipe.write_frame(
                             FRAME_LOG,
                             format!("Screen stream start failed: {}", error).as_bytes(),
@@ -610,6 +637,7 @@ fn handle_control(
                 handle.stop();
                 crate::log_line!("Session helper screen streaming DISABLED 🛑");
             }
+            let _ = notice.screen(false);
         }
 
         Some("GPS_COLLECTION") => {
@@ -772,6 +800,7 @@ pub struct SessionBridge {
 
     /// The most recent fix reported by the helper, waiting to be sent.
     fix: Arc<Mutex<Option<(f64, f64)>>>,
+    activity: Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>,
 }
 
 impl SessionBridge {
@@ -787,6 +816,7 @@ impl SessionBridge {
             control_gate: Arc::new(Mutex::new(())),
             link: None,
             fix: Arc::new(Mutex::new(None)),
+            activity: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -900,6 +930,10 @@ impl SessionBridge {
     ///
     /// Taking rather than peeking keeps the loop's "enabled but no fix yet"
     /// diagnostic meaningful: it appears once per fix rather than on every tick.
+    pub fn take_activity(&self) -> Vec<serde_json::Value> {
+        self.activity.lock().map(|mut events| events.drain(..).collect()).unwrap_or_default()
+    }
+
     pub fn take_fix(&self) -> Option<(f64, f64)> {
         self.fix.lock().ok().and_then(|mut slot| slot.take())
     }
@@ -993,6 +1027,7 @@ impl SessionBridge {
             let wanted = Arc::clone(&self.wanted);
             let control_gate = Arc::clone(&self.control_gate);
             let fix = Arc::clone(&self.fix);
+            let activity = Arc::clone(&self.activity);
 
             std::thread::spawn(move || {
                 // Blocking, so it cannot happen on the async loop.
@@ -1094,6 +1129,19 @@ impl SessionBridge {
                                     "Discarded a malformed location reading from the session helper: {}",
                                     error
                                 ),
+                            }
+                        }
+
+                        Ok((FRAME_ACTIVITY, payload)) => {
+                            if payload.len() <= 2048 {
+                                if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                                    if matches!(event.get("type").and_then(|v| v.as_str()), Some("application_activity" | "user_presence")) {
+                                        if let Ok(mut queue) = activity.lock() {
+                                            if queue.len() >= 128 { queue.pop_front(); }
+                                            queue.push_back(event);
+                                        }
+                                    }
+                                }
                             }
                         }
 

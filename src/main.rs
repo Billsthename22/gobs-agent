@@ -1,5 +1,9 @@
 mod service;
 mod power;
+#[cfg(any(target_os = "windows", test))]
+mod presence;
+#[cfg(target_os = "windows")]
+mod windows_notice;
 
 #[cfg(target_os = "macos")]
 mod location;
@@ -460,6 +464,15 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
     let mut session_bridge = session::SessionBridge::new(screen_tx.clone());
 
     let helper_owns_capture = session_bridge.delegates();
+    #[cfg(target_os = "windows")]
+    let foreground_notice = if !helper_owns_capture {
+        match windows_notice::Notice::start() {
+            Ok(notice) => Some(notice),
+            Err(error) => { crate::log_line!("{}", error); return; }
+        }
+    } else { None };
+    #[cfg(target_os = "windows")]
+    let mut foreground_presence = presence::Tracker::default();
 
     // GPS collection is disabled by default.
     // The backend explicitly enables it through an authorized
@@ -488,7 +501,7 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
     // iterations.
     let mut stop_signals = StopSignals::new();
 
-    loop {
+    'connection: loop {
         tokio::select! {
             // WINDOWS SERVICE SHUTDOWN
             _ = async {
@@ -690,6 +703,8 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
             // SCREEN STREAM
             // Encoded H.264 frames arrive from the capture thread's channel.
             Some(packet) = screen_rx.recv() => {
+                #[cfg(target_os = "windows")]
+                if foreground_notice.as_ref().is_some_and(|notice| !notice.healthy()) { break; }
                 let is_config =
                     packet.kind == video::STREAM_KIND_CONFIG;
 
@@ -720,6 +735,20 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
                 // in, and end it when they log out or switch away. Inert unless
                 // this process is the Windows service.
                 session_bridge.tick();
+                #[cfg(target_os = "windows")]
+                let mut events = session_bridge.take_activity();
+                #[cfg(not(target_os = "windows"))]
+                let events = session_bridge.take_activity();
+                #[cfg(target_os = "windows")]
+                if let Some(notice) = &foreground_notice {
+                    if !notice.healthy() { break; }
+                    if let Some((app, idle)) = windows_notice::sample() {
+                        events.extend(foreground_presence.sample(app, idle));
+                    }
+                }
+                for event in events {
+                    if websocket.send(Message::Text(event.to_string().into())).await.is_err() { break 'connection; }
+                }
 
                 let current_console_user = detect_console_user();
 
@@ -834,6 +863,11 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
 
                                             session_bridge.set_screen(true);
                                         } else if screen_stream.is_none() {
+                                            #[cfg(target_os = "windows")]
+                                            if !foreground_notice.as_ref().is_some_and(|notice| notice.screen(true)) {
+                                                crate::log_line!("Screen monitoring refused: employee indicator unavailable");
+                                                continue;
+                                            }
                                             crate::log_line!(
                                                 "Screen streaming ENABLED 🖥️ (H.264)"
                                             );
@@ -846,6 +880,8 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
                                                         Some(handle);
                                                 }
                                                 Err(error) => {
+                                                    #[cfg(target_os = "windows")]
+                                                    if let Some(notice) = &foreground_notice { let _ = notice.screen(false); }
                                                     crate::log_line!(
                                                         "Screen stream start failed ❌"
                                                     );
@@ -874,6 +910,8 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
                                                 "Screen streaming DISABLED 🛑"
                                             );
                                         }
+                                        #[cfg(target_os = "windows")]
+                                        if let Some(notice) = &foreground_notice { let _ = notice.screen(false); }
                                     }
 
                                     Some("GPS_COLLECTION") => {

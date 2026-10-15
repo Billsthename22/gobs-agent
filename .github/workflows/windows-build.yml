@@ -24,6 +24,9 @@ jobs:
       - name: Build agent
         run: cargo build --release --bin agent --target x86_64-pc-windows-msvc
 
+      - name: Test agent
+        run: cargo test --bin agent --target x86_64-pc-windows-msvc
+
       # The installer is built here rather than on a Mac because NSIS on Windows
       # is the supported path, and because the .exe it packages can only be
       # produced here: cross-compiling MSVC from macOS is not possible.

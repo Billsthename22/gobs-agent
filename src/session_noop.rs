@@ -42,6 +42,8 @@ impl SessionBridge {
     pub fn set_gps(&mut self, _enabled: bool) {}
 
     /// Never has a fix: the event loop reads the in-process manager.
+    pub fn take_activity(&self) -> Vec<serde_json::Value> { Vec::new() }
+
     pub fn take_fix(&self) -> Option<(f64, f64)> {
         None
     }
