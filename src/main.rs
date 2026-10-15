@@ -1162,6 +1162,10 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
 /// before anything else, so the same binary both runs the agent and manages
 /// its own installation.
 fn main() -> ExitCode {
+    if std::env::args().any(|argument| argument == "--version") {
+        println!("GBOS agent {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if let Some(command) = service::command_from_args() {
         return handle_service_command(command);
     }
@@ -1266,6 +1270,8 @@ extern "system" fn ffi_service_main(_argc: u32, _argv: *mut *mut u16) {
     // SCM jumps straight into the dispatcher.
     logging::init(logging::default_log_path());
     logging::set_stdout_echo(false);
+
+    crate::log_line!("GBOS agent version {}", env!("CARGO_PKG_VERSION"));
 
     // From here on the agent is Session 0, so screen and location have to come
     // from a helper in the user's session rather than from this process.

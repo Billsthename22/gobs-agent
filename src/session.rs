@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR,
+    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows::Win32::Security::{
     DuplicateTokenEx, InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
@@ -55,13 +55,14 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeClientSessionId,
     PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessWithTokenW,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessAsUserW, CreateProcessWithTokenW,
     LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
@@ -128,6 +129,30 @@ impl Drop for Pipe {
 }
 
 impl Pipe {
+    /// Each pending operation owns an event until completion. An overlapped
+    /// handle allows the control reader and activity/video writer to progress
+    /// independently; separate threads on a synchronous handle do not provide
+    /// that guarantee.
+    fn operation() -> io::Result<(Owned, OVERLAPPED)> {
+        let handle = unsafe { CreateEventW(None, true, false, None) }
+            .map_err(|error| io::Error::other(format!("CreateEventW failed: {}", Self::windows_error(&error))))?;
+        Ok((Owned { handle }, OVERLAPPED { hEvent: handle, ..Default::default() }))
+    }
+
+    fn complete(&self, operation: &OVERLAPPED, result: windows::core::Result<()>) -> io::Result<u32> {
+        if let Err(error) = result {
+            if error.code() != ERROR_IO_PENDING.to_hresult() {
+                return Err(io::Error::other(Self::windows_error(&error)));
+            }
+        }
+        let mut transferred = 0;
+        // Wait on this operation's event, never on the shared pipe handle.
+        // The buffer, event and OVERLAPPED stay alive until completion.
+        unsafe { GetOverlappedResult(self.handle, operation, &mut transferred, true) }
+            .map_err(|error| io::Error::other(Self::windows_error(&error)))?;
+        Ok(transferred)
+    }
+
     fn windows_error(error: &windows::core::Error) -> String {
         let hresult = error.code().0 as u32;
         let win32 = WIN32_ERROR::from_error(error)
@@ -143,20 +168,19 @@ impl Pipe {
 
         while filled < buffer.len() {
             let mut read = 0u32;
+            let (_event, mut operation) = Self::operation()?;
 
             // SAFETY: `buffer[filled..]` is valid for the duration of the call
             // and `read` is a live out-parameter.
-            unsafe {
+            let result = unsafe {
                 ReadFile(
                     self.handle,
                     Some(&mut buffer[filled..]),
                     Some(&mut read),
-                    None,
+                    Some(&mut operation),
                 )
-            }
-            .map_err(|error| {
-                io::Error::other(format!("ReadFile failed: {}", Self::windows_error(&error)))
-            })?;
+            };
+            let read = self.complete(&operation, result)?;
 
             if read == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipe closed"));
@@ -204,13 +228,12 @@ impl Pipe {
 
         while written < bytes.len() {
             let mut wrote = 0u32;
+            let (_event, mut operation) = Self::operation()?;
 
             // SAFETY: `bytes[written..]` is valid for the duration of the call
             // and `wrote` is a live out-parameter.
-            unsafe { WriteFile(self.handle, Some(&bytes[written..]), Some(&mut wrote), None) }
-                .map_err(|error| {
-                    io::Error::other(format!("WriteFile failed: {}", Self::windows_error(&error)))
-                })?;
+            let result = unsafe { WriteFile(self.handle, Some(&bytes[written..]), Some(&mut wrote), Some(&mut operation)) };
+            let wrote = self.complete(&operation, result)?;
 
             if wrote == 0 {
                 return Err(io::Error::new(io::ErrorKind::WriteZero, "pipe closed"));
@@ -281,7 +304,7 @@ impl Pipe {
     /// Connect to the service's pipe as the helper.
     fn connect(pipe_name: &str) -> io::Result<Self> {
         use windows::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
             FILE_SHARE_NONE, OPEN_EXISTING,
         };
 
@@ -295,7 +318,7 @@ impl Pipe {
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 None,
             )
         }
@@ -371,7 +394,7 @@ impl Pipe {
         let handle = unsafe {
             CreateNamedPipeW(
                 windows::core::PCWSTR(wide.as_ptr()),
-                windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+                windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1,
                 64 * 1024,
@@ -396,9 +419,13 @@ impl Pipe {
 
     /// Wait for the helper to connect. Blocking — call on a dedicated thread.
     fn accept_connection(&self) -> io::Result<()> {
+        let (_event, mut operation) = Self::operation()?;
         // SAFETY: the handle is a live pipe handle with no pending operations.
-        match unsafe { ConnectNamedPipe(self.handle, None) } {
+        match unsafe { ConnectNamedPipe(self.handle, Some(&mut operation)) } {
             Ok(()) => Ok(()),
+            Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
+                self.complete(&operation, Err(error)).map(|_| ())
+            }
 
             // The helper can open the pipe in the interval between
             // CreateNamedPipeW and this call. Windows documents this as a
@@ -467,7 +494,11 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
     crate::log_line!("Session helper connected to the service pipe");
     let notice = match crate::windows_notice::Notice::start() {
         Ok(notice) => notice,
-        Err(error) => { crate::log_line!("{}", error); return std::process::ExitCode::FAILURE; }
+            Err(error) => {
+                let _ = pipe.write_frame(FRAME_LOG, format!("Monitoring notice startup failed: {error}").as_bytes());
+                crate::log_line!("{}", error);
+                return std::process::ExitCode::FAILURE;
+            }
     };
     let mut presence = crate::presence::Tracker::default();
     let mut presence_timer = tokio::time::interval(Duration::from_secs(5));
@@ -533,7 +564,10 @@ async fn helper_main(pipe_name: String) -> std::process::ExitCode {
             }
 
             _ = presence_timer.tick() => {
-                if !notice.healthy() { break; }
+                if !notice.healthy() {
+                    let _ = pipe.write_frame(FRAME_LOG, b"Monitoring notice stopped; stopping per-user collection");
+                    break;
+                }
                 if let Some((app, idle)) = crate::windows_notice::sample() {
                     for event in presence.sample(app, idle) {
                         if pipe.write_frame(FRAME_ACTIVITY, event.to_string().as_bytes()).is_err() {
@@ -1473,4 +1507,76 @@ fn nonce() -> u64 {
         .unwrap_or_default();
 
     nanos ^ ((std::process::id() as u64) << 32)
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::*;
+
+    #[test]
+    fn pending_control_read_does_not_block_app_or_video_uploads() {
+        let name = format!(r"\\.\pipe\gbos-duplex-test-{:016x}", nonce());
+        let server = Arc::new(Pipe::create_server(&name).unwrap());
+        let accepting = {
+            let server = server.clone();
+            std::thread::spawn(move || server.accept_connection())
+        };
+        let client = Arc::new(Pipe::connect(&name).unwrap());
+        accepting.join().unwrap().unwrap();
+        let (frames_tx, frames_rx) = std::sync::mpsc::channel();
+        let receiver = {
+            let server = server.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let frame = server.read_frame();
+                    if frames_tx.send(frame).is_err() { break; }
+                }
+            })
+        };
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let control_reader = {
+            let client = client.clone();
+            std::thread::spawn(move || {
+                let _ = ready_tx.send(());
+                let _ = control_tx.send(client.read_control_line());
+            })
+        };
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Let the control read become pending before either upload begins.
+        std::thread::sleep(Duration::from_millis(100));
+        let app = br#"{"type":"application_activity","application":"chrome.exe"}"#;
+        let video = vec![0xA5; 128 * 1024]; // larger than the pipe buffer
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let sender = {
+            let client = client.clone();
+            let video = video.clone();
+            std::thread::spawn(move || {
+                let result = client.write_frame(FRAME_ACTIVITY, app)
+                    .and_then(|_| client.write_frame(FRAME_VIDEO, &video));
+                let _ = write_tx.send(result);
+            })
+        };
+        let result = (|| -> Result<(), String> {
+            let first = frames_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "app upload blocked while control reader waited")?.map_err(|error| error.to_string())?;
+            assert_eq!(first, (FRAME_ACTIVITY, app.to_vec()));
+            let second = frames_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "video upload blocked")?.map_err(|error| error.to_string())?;
+            assert_eq!(second, (FRAME_VIDEO, video));
+            write_rx.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+            server.write_line("STOP_SCREEN_STREAM").map_err(|error| error.to_string())?;
+            let control = control_rx.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+            assert_eq!(control, "STOP_SCREEN_STREAM");
+            Ok(())
+        })();
+        if let Err(error) = result {
+            unsafe {
+                let _ = windows::Win32::System::IO::CancelIoEx(server.handle, None);
+                let _ = windows::Win32::System::IO::CancelIoEx(client.handle, None);
+            }
+            panic!("{error}");
+        }
+        sender.join().unwrap();
+        receiver.join().unwrap();
+        control_reader.join().unwrap();
+    }
 }
