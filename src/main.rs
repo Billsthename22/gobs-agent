@@ -32,6 +32,22 @@ use std::env;
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// Service installs can read this file without inheriting a shell environment.
+fn device_token() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(token) = env::var("GBOS_DEVICE_TOKEN") {
+        if !token.trim().is_empty() { return Ok(token.trim().to_string()); }
+    }
+    let default_path = if cfg!(target_os = "windows") {
+        format!("{}\\GBOS\\device-token", env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string()))
+    } else {
+        "/Library/Application Support/GBOS/device-token".to_string()
+    };
+    let path = env::var("GBOS_DEVICE_TOKEN_FILE").unwrap_or(default_path);
+    let token = std::fs::read_to_string(path)?.trim().to_string();
+    if token.is_empty() { return Err("Device credential is empty".into()); }
+    Ok(token)
+}
+
 /// Backend the agent talks to, overridable per install.
 ///
 /// Also baked into the macOS launchd plist and read from the service
@@ -39,7 +55,7 @@ use std::time::Duration;
 /// environment and cannot inherit this from an interactive shell.
 pub(crate) fn gbos_api_url() -> String {
     env::var("GBOS_API_URL")
-        .unwrap_or_else(|_| "https://gbos-backend-production.up.railway.app".to_string())
+        .unwrap_or_else(|_| "https://gbos-backend.onrender.com".to_string())
         .trim_end_matches('/')
         .to_string()
 }
@@ -93,6 +109,7 @@ async fn register_agent() -> Result<i32, Box<dyn std::error::Error>> {
 
     let response = client
         .post(format!("{}/agents/register", gbos_api_url()))
+        .bearer_auth(device_token()?)
         .json(&payload)
         .send()
         .await?;
@@ -116,7 +133,7 @@ async fn register_agent() -> Result<i32, Box<dyn std::error::Error>> {
     Ok(registration.device_id)
 }
 
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::{Message, client::IntoClientRequest}};
 
 fn current_username() -> String {
     env::var("USER")
@@ -351,7 +368,16 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
     crate::log_line!("GBOS Device Agent");
     crate::log_line!("Connecting to {}", url);
 
-    let (mut websocket, _) = match connect_async(&url).await {
+    let request = (|| -> Result<_, Box<dyn std::error::Error>> {
+        let mut request = url.as_str().into_client_request()?;
+        request.headers_mut().insert("Authorization", format!("Bearer {}", device_token()?).parse()?);
+        Ok(request)
+    })();
+    let request = match request {
+        Ok(request) => request,
+        Err(_) => { crate::log_line!("A valid device credential is required"); return; }
+    };
+    let (mut websocket, _) = match connect_async(request).await {
         Ok(connection) => {
             crate::log_line!("Connected to GBOS backend ✅");
             connection
