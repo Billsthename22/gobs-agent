@@ -1,4 +1,7 @@
 /target
+.env*
+!.env.example
+device-token
 .DS_Store
 
 # Local/generated macOS app bundle
