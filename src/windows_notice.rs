@@ -163,7 +163,9 @@ unsafe fn run(
             match command {
                 Command::Stop => break 'main,
                 Command::Screen(enabled, reply) => {
-                    streaming = enabled;
+                    if banner.is_some_and(|window| !unsafe { IsWindow(Some(window)) }.as_bool()) {
+                        banner = None;
+                    }
                     if enabled && banner.is_none() {
                         banner = unsafe { create_banner(instance.into()) }.ok();
                     }
@@ -172,10 +174,11 @@ unsafe fn run(
                             let _ = unsafe { DestroyWindow(window) };
                         }
                     }
+                    streaming = enabled && banner.is_some();
                     let status = wide(&format!(
                         "{}\r\n\r\nLive screen monitoring: {}",
                         NOTICE,
-                        if enabled { "ACTIVE" } else { "off" }
+                        if streaming { "ACTIVE" } else { "off" }
                     ));
                     let _ = unsafe { SetWindowTextW(label, PCWSTR(status.as_ptr())) };
                     let _ = reply.send(!enabled || banner.is_some());
