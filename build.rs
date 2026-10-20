@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=GBOS_UPDATE_PUBLIC_KEY");
     // NOTE: this build script is compiled for the *host*, so `cfg!(target_os)`
     // here would test macOS even when cross-compiling to Windows. Cargo exposes
     // the actual target platform to build scripts via CARGO_CFG_TARGET_OS.

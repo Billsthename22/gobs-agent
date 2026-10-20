@@ -1,5 +1,6 @@
 mod service;
 mod power;
+mod updates;
 #[cfg(any(target_os = "windows", test))]
 mod presence;
 #[cfg(target_os = "windows")]
@@ -321,6 +322,7 @@ async fn run_agent(mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>) 
     };
 
     crate::log_line!("GBOS agent registered with device ID {}", device_id);
+    let _updater = updates::start(device_id);
 
     loop {
         if shutdown_rx
@@ -836,6 +838,7 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
                         match serde_json::from_str::<serde_json::Value>(&text) {
                             Ok(message) => {
                                 match message.get("type").and_then(|value| value.as_str()) {
+                                    Some("heartbeat_ack") => updates::confirm_connection(),
                                     Some("START_SCREEN_STREAM") => {
                                         if !video::SCREEN_STREAM_SUPPORTED {
                                             // Refusing loudly beats silently
@@ -1162,6 +1165,9 @@ async fn run_session(device_id: i32, shutdown_rx: &mut Option<tokio::sync::watch
 /// before anything else, so the same binary both runs the agent and manages
 /// its own installation.
 fn main() -> ExitCode {
+    if std::env::args().any(|argument| argument == "--apply-update") {
+        return updates::apply_update();
+    }
     if std::env::args().any(|argument| argument == "--version") {
         println!("GBOS agent {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;

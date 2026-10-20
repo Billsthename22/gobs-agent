@@ -1,6 +1,10 @@
+# Admin-approved updates
+
+Version 0.1.4 adds an optional signed updater. Builds require a pinned `GBOS_UPDATE_PUBLIC_KEY` to enable remote updates. Existing installations need one manual bootstrap upgrade. See the adjacent [backend update guide](../backend/AGENT_UPDATES.md) before building or distributing updater-enabled releases.
+
 # GBOS device agent
 
-Version 0.1.3 connects to `https://gbos-backend.onrender.com` by default and authenticates registration and WebSocket connections with a **per-device credential**. Upgrading from 0.1.1 or 0.1.2 preserves the existing credential file.
+Version 0.1.4 connects to `https://gbos-backend.onrender.com` by default and authenticates registration and WebSocket connections with a **per-device credential**. Upgrading from 0.1.1 or 0.1.2 preserves the existing credential file.
 
 Version 0.1.3 changes the Windows helper pipe to overlapped I/O, with a separate completion event for each read/write/connect. A pending control read can no longer hold up application or video uploads on the same pipe. The native Windows regression test uploads app data and a video-sized payload while the control reader waits. The service logs its version at startup; `GBOS-Agent.exe --version` prints the binary version without starting the agent. Notice startup failures are forwarded to the service log even when the employee account cannot write to the protected log folder.
 

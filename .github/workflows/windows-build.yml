@@ -10,6 +10,8 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      GBOS_UPDATE_PUBLIC_KEY: ${{ vars.GBOS_UPDATE_PUBLIC_KEY }}
 
     steps:
       - name: Checkout
