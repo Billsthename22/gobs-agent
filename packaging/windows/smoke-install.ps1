@@ -58,13 +58,14 @@ try {
     $listener.Start()
 
     # Defense in depth: even if a future change loses the service environment
-    # override, this executable cannot reach the production backend. Keep this
-    # guard in place until cleanup has stopped every installed agent process.
+    # override, this executable cannot reach the public production backend.
+    # Use the supported Internet keyword rather than wildcard IP ranges, which
+    # Windows rejects. Keep this guard until every agent process has stopped.
     $firewallProfiles = @(Get-NetFirewallProfile)
     Set-NetFirewallProfile -Profile @('Domain', 'Private', 'Public') -Enabled True
     New-NetFirewallRule -Name $firewallRule -DisplayName $firewallRule `
         -Direction Outbound -Action Block -Program $agentExecutable -Profile Any `
-        -RemoteAddress @('0.0.0.0-126.255.255.255', '128.0.0.0-255.255.255.255', '::/0') `
+        -RemoteAddress Internet `
         -Enabled True | Out-Null
     $firewallCreated = $true
     if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count -ne 0) {

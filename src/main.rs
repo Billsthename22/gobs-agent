@@ -287,7 +287,22 @@ async fn run_agent(mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>) 
             return;
         }
 
-        match register_agent().await {
+        // Setup may stop an older service while its backend is waking up or
+        // unavailable. Cancel registration immediately when Windows asks us
+        // to stop so an upgrade does not wait on a network request.
+        let registration = if let Some(receiver) = shutdown_rx.as_mut() {
+            tokio::select! {
+                result = register_agent() => result,
+                _ = receiver.changed() => {
+                    crate::log_line!("GBOS service shutdown requested during registration 🛑");
+                    return;
+                }
+            }
+        } else {
+            register_agent().await
+        };
+
+        match registration {
             Ok(id) => break id,
             Err(error) => {
                 crate::log_line!("Agent registration failed!");
