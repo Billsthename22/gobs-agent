@@ -1,6 +1,7 @@
 mod service;
 mod power;
 mod updates;
+mod identity;
 #[cfg(any(target_os = "windows", test))]
 mod presence;
 #[cfg(target_os = "windows")]
@@ -45,18 +46,7 @@ use std::time::Duration;
 
 /// Service installs can read this file without inheriting a shell environment.
 fn device_token() -> Result<String, Box<dyn std::error::Error>> {
-    if let Ok(token) = env::var("GBOS_DEVICE_TOKEN") {
-        if !token.trim().is_empty() { return Ok(token.trim().to_string()); }
-    }
-    let default_path = if cfg!(target_os = "windows") {
-        format!("{}\\GBOS\\device-token", env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string()))
-    } else {
-        "/Library/Application Support/GBOS/device-token".to_string()
-    };
-    let path = env::var("GBOS_DEVICE_TOKEN_FILE").unwrap_or(default_path);
-    let token = std::fs::read_to_string(path)?.trim().to_string();
-    if token.is_empty() { return Err("Device credential is empty".into()); }
-    Ok(token)
+    identity::device_token().map_err(Into::into)
 }
 
 /// Backend the agent talks to, overridable per install.
@@ -111,7 +101,8 @@ async fn register_agent() -> Result<i32, Box<dyn std::error::Error>> {
         "device_name": hostname,
         "hostname": hostname,
         "operating_system": operating_system,
-        "ip_address": null
+        "ip_address": null,
+        "auto_enroll": true
     });
 
     crate::log_line!("Registering agent with GBOS backend...");
@@ -1190,6 +1181,13 @@ fn handle_service_command(command: service::Command) -> ExitCode {
     // Service commands run from a terminal, so echo to stdout as well as the
     // log file.
     logging::init(logging::default_log_path());
+
+    if command == service::Command::InstallService {
+        if let Err(error) = device_token() {
+            crate::log_line!("Could not prepare this computer's device identity: {}", error);
+            return ExitCode::FAILURE;
+        }
+    }
 
     service::run(command)
 }

@@ -63,6 +63,11 @@ jobs:
 
           if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
 
+      - name: Smoke test Windows installation and automatic enrollment
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./packaging/windows/smoke-install.ps1 -InstallerPath ./dist/GBOS-Agent-Windows.exe
+
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:

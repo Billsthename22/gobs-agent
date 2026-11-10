@@ -4,7 +4,7 @@ Version 0.1.4 adds an optional signed updater. Builds require a pinned `GBOS_UPD
 
 # GBOS device agent
 
-Version 0.1.4 connects to `https://gbos-backend.onrender.com` by default and authenticates registration and WebSocket connections with a **per-device credential**. Upgrading from 0.1.1 or 0.1.2 preserves the existing credential file.
+Version 0.1.5 connects automatically after installation. It defaults to `https://gbos-backend.onrender.com`, creates its own machine identity, and registers the computer in Devices. There is no manual credential, hostname entry, or PowerShell setup. Existing installations retain their saved identity.
 
 Version 0.1.3 changes the Windows helper pipe to overlapped I/O, with a separate completion event for each read/write/connect. A pending control read can no longer hold up application or video uploads on the same pipe. The native Windows regression test uploads app data and a video-sized payload while the control reader waits. The service logs its version at startup; `GBOS-Agent.exe --version` prints the binary version without starting the agent. Notice startup failures are forwarded to the service log even when the employee account cannot write to the protected log folder.
 
@@ -16,38 +16,27 @@ Employees are informed during company onboarding. Routine app/idle reporting pro
 
 The helper sends events through the existing authenticated service connection. Its bounded event queue is held in memory, not a durable offline history. No additional database columns are required; the backend stores `APPLICATION_ACTIVE`, `USER_ACTIVE`, and `USER_IDLE` activity records.
 
-## Enrolling a machine
+## Installing a machine
 
-1. Sign in to the frontend as an administrator and open **Settings → Workspace access and audit history**.
-2. Create a device record if needed. Its hostname must match the actual machine (`hostname` on macOS; `$env:COMPUTERNAME` in Windows PowerShell).
-3. Choose **Issue credential** for that device. Copy the credential immediately; only its SHA-256 hash is stored in the backend. Issuing another credential invalidates the previous one and disconnects its agent.
-4. Install the updated agent and provision the credential on that machine as described below. Restart its service after changing the credential.
+1. Download the latest installer from GBOS. On Windows, open `GBOS-Agent-Windows.exe` and approve the administrator prompt. The installer uses the existing installation folder or `C:\Program Files\GBOS` automatically.
+2. Finish the installer. The background service starts automatically, including after a restart.
+3. Open Devices in GBOS. The computer appears online when it connects. An offline computer retries automatically when its connection returns.
 
-Existing database device records can be reused. Agents no longer create or claim device records anonymously.
+The macOS installer starts its LaunchDaemon automatically too. Install the updated package; no credential provisioning is needed.
 
-## Credential configuration
+The agent generates and securely saves a random machine identity before contacting the backend. A new hostname is enrolled automatically, or an active precreated record without an identity is linked. Registration and WebSocket connections then authenticate using that identity. An existing enrolled hostname cannot be claimed with a different identity, and inactive records remain blocked. A lost identity or hostname conflict can be handled by an administrator through advanced device recovery.
 
-The agent first checks the process/service environment variable `GBOS_DEVICE_TOKEN`. If unset, it reads a file containing only the credential:
+## Advanced configuration
+
+Normal installation needs no configuration. Existing deployments and development environments can still supply `GBOS_DEVICE_TOKEN` or use `GBOS_DEVICE_TOKEN_FILE`. Otherwise the agent creates and reuses its identity at:
 
 - Windows: `C:\ProgramData\GBOS\device-token` (uses the system's `ProgramData` value).
 - macOS: `/Library/Application Support/GBOS/device-token`.
 - Custom location: set `GBOS_DEVICE_TOKEN_FILE` in the actual service environment.
 
-Restrict the file to the service account and machine administrators. Do not save it in this repository, include it in an installer, or share it between devices. A shell environment variable is not automatically inherited by installed services. The standard file locations work without passing shell variables to a service.
+The agent protects the default identity directory and file for the service account and administrators. Do not distribute the saved file between machines or include it in an installer. Explicit environment credentials and unreadable or invalid existing files are never silently replaced. A shell variable is not automatically inherited by installed services.
 
-On macOS, create `/Library/Application Support/GBOS` as root, put the credential in its `device-token` file, and set the directory to mode `700` and the file to `600`, owned by root. Restart the installed LaunchDaemon with:
-
-```sh
-sudo launchctl kickstart -k system/com.gbaja.gbos.agent
-```
-
-On Windows, create the credential file from an Administrator PowerShell session and restrict its ACL to `SYSTEM` and the local Administrators group. The Windows service runs as LocalSystem. Restart it after provisioning:
-
-```powershell
-Restart-Service GBOSAgent
-```
-
-For a foreground development run, set `GBOS_DEVICE_TOKEN` in that terminal and run `cargo run --bin agent`. The `.env.example` file documents variables; the agent does not load `.env` automatically.
+For a foreground development run, point `GBOS_DEVICE_TOKEN_FILE` at an existing development identity file and run `cargo run --bin agent`. The `.env.example` file documents optional variables; the agent does not load `.env` automatically.
 
 `GBOS_API_URL` overrides the default backend. Ensure the credential belongs to the backend being used. HTTP registration sends a bearer header; WebSocket connections also authenticate with a bearer header. Tokens are not placed in connection URLs.
 

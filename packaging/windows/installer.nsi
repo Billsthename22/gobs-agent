@@ -63,8 +63,10 @@ VIAddVersionKey "ProductVersion" "${PRODUCT_VERSION}"
 VIAddVersionKey "CompanyName" "${PRODUCT_PUBLISHER}"
 
 !define MUI_ABORTWARNING
-!insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+!define MUI_FINISHPAGE_TITLE "GBOS is ready"
+!define MUI_FINISHPAGE_TEXT "GBOS will connect automatically when this computer has internet access.$\r$\n$\r$\nOpen Devices in GBOS to see this computer. Setup is complete."
+!insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
@@ -93,6 +95,12 @@ Function .onInit
 
     ; The uninstall key and the InstallDir key are both under the 64-bit view.
     SetRegView 64
+    ; InstallDirRegKey uses the installer's default registry view. Read the
+    ; saved 64-bit value explicitly so upgrades retain an existing custom path.
+    ReadRegStr $0 HKLM "Software\GBOS\Agent" "InstallDir"
+    ${If} $0 != ""
+        StrCpy $INSTDIR $0
+    ${EndIf}
 FunctionEnd
 
 Section "GBOS Agent" SecMain
@@ -111,8 +119,30 @@ Section "GBOS Agent" SecMain
         nsExec::ExecToLog '"$INSTDIR\${EXE_NAME}" --uninstall-service'
         Pop $0
 
-        ; The SCM releases the image slightly after the process exits.
-        Sleep 1500
+        ${If} $0 != 0
+            MessageBox MB_OK|MB_ICONSTOP "GBOS could not stop the previous installation.$\r$\n$\r$\nRestart this computer and run this installer again."
+            SetErrorLevel 1
+            Abort
+        ${EndIf}
+
+        ; Service deletion can outlive its stop command. Wait for Windows to
+        ; release the registration before replacing the executable.
+        StrCpy $3 0
+        ${Do}
+            nsExec::ExecToStack '"$SYSDIR\sc.exe" query GBOSAgent'
+            Pop $0
+            Pop $1
+            ${If} $0 == 1060
+                ${ExitDo}
+            ${EndIf}
+            IntOp $3 $3 + 1
+            ${If} $3 >= 40
+                MessageBox MB_OK|MB_ICONSTOP "Windows is still stopping the previous GBOS installation.$\r$\n$\r$\nRestart this computer and run this installer again."
+                SetErrorLevel 1
+                Abort
+            ${EndIf}
+            Sleep 500
+        ${Loop}
     ${EndIf}
 
     SetOutPath "$INSTDIR"
@@ -125,11 +155,9 @@ Section "GBOS Agent" SecMain
     Pop $0
 
     ${If} $0 != 0
-        ; The files are installed and correct, so this is reported rather than
-        ; treated as a failed installation — the same reasoning as the macOS
-        ; postinstall. No quotes around $INSTDIR in the message: a double quote
-        ; would end the NSIS string.
-        MessageBox MB_ICONEXCLAMATION "The ${PRODUCT_NAME} service could not be started (exit code $0).$\r$\n$\r$\nThe agent is installed. To retry, open an elevated Command Prompt, change to $INSTDIR, and run ${EXE_NAME} --install-service."
+        MessageBox MB_OK|MB_ICONSTOP "GBOS could not finish setup (exit code $0).$\r$\n$\r$\nRestart this computer and run this installer again. If setup still fails, the details are in C:\ProgramData\GBOS\Agent\agent.log."
+        SetErrorLevel 1
+        Abort
     ${EndIf}
 
     WriteRegStr HKLM "Software\GBOS\Agent" "InstallDir" "$INSTDIR"

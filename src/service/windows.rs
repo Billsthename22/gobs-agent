@@ -96,6 +96,8 @@ pub fn install() -> Result<(), String> {
         Err(error) => return Err(format!("could not start the service: {}", error)),
     }
 
+    wait_for_state(&service, ServiceState::Running, Duration::from_secs(20))?;
+
     crate::log_line!(
         "GBOS agent service '{}' installed and running",
         SERVICE_NAME
@@ -118,23 +120,26 @@ pub fn uninstall() -> Result<(), String> {
     let service = match manager.open_service(SERVICE_NAME, INSTALL_ACCESS) {
         Ok(service) => service,
 
-        // Not installed: nothing to do.
-        Err(_) => {
+        // Not installed: nothing to do. Other errors must reach setup so it
+        // does not replace files while a service it could not open is running.
+        Err(error) if is_win32_error(&error, 1060) => {
             crate::log_line!("GBOS agent service '{}' is not installed", SERVICE_NAME);
 
             return Ok(());
         }
+        Err(error) => return Err(format!("could not open the existing service: {}", error)),
     };
 
-    if let Ok(status) = service.query_status() {
-        if status.current_state != ServiceState::Stopped {
-            // A stop failure should not block removal, so report and continue.
-            if let Err(error) = service.stop() {
-                crate::log_line!("Could not stop the service cleanly: {}", error);
-            } else if let Err(error) = wait_for_stopped(&service, Duration::from_secs(20)) {
-                crate::log_line!("Service did not report Stopped: {}", error);
-            }
+    let status = service
+        .query_status()
+        .map_err(|error| format!("could not query service status: {}", error))?;
+    if status.current_state != ServiceState::Stopped {
+        if status.current_state != ServiceState::StopPending {
+            service
+                .stop()
+                .map_err(|error| format!("could not stop the service: {}", error))?;
         }
+        wait_for_state(&service, ServiceState::Stopped, Duration::from_secs(20))?;
     }
 
     service
@@ -268,15 +273,16 @@ fn apply_recovery_actions(service: &windows_service::service::Service) {
     }
 }
 
-fn wait_for_stopped(
+fn wait_for_state(
     service: &windows_service::service::Service,
+    expected: ServiceState,
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
 
     while std::time::Instant::now() < deadline {
         match service.query_status() {
-            Ok(status) if status.current_state == ServiceState::Stopped => return Ok(()),
+            Ok(status) if status.current_state == expected => return Ok(()),
 
             Ok(_) => std::thread::sleep(Duration::from_millis(250)),
 
@@ -284,7 +290,7 @@ fn wait_for_stopped(
         }
     }
 
-    Err(format!("timed out after {:?}", timeout))
+    Err(format!("service did not reach {:?} within {:?}", expected, timeout))
 }
 
 /// True when a `windows-service` error wraps the given Win32 error code.
